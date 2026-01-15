@@ -1,7 +1,7 @@
 id=nomount
 metamodule=true
 name=NoMount Universal Hijacker
-version=v0.2.0
-versionCode=2
+version=v0.3.0
+versionCode=3
 author=maxsteeel, Enginex0
 description=Universal Hijacker - VFS path redirection replaces all mounts
