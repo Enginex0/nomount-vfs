@@ -48,6 +48,19 @@ if [ ! -c "/dev/nomount" ]; then
 fi
 
 echo "[OK] /dev/nomount ready - proceeding with VFS registration" >> "$LOG_FILE"
+
+# ============================================================
+# HIDE /dev/nomount FROM NON-ROOT DETECTION APPS
+# ============================================================
+# Kernel-level hiding returns ENOENT for non-root open() calls
+# SUSFS sus_path provides additional protection (hides from readdir too)
+if command -v ksu_susfs >/dev/null 2>&1; then
+    ksu_susfs add_sus_path /dev/nomount 2>/dev/null
+    echo "[HIDE] /dev/nomount hidden via SUSFS sus_path" >> "$LOG_FILE"
+else
+    echo "[HIDE] /dev/nomount protected by kernel-level hiding (SUSFS not available)" >> "$LOG_FILE"
+fi
+
 echo "" >> "$LOG_FILE"
 
 # ============================================================
