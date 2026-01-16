@@ -231,7 +231,7 @@ register_sus_map_for_module() {
     for partition in $TARGET_PARTITIONS; do
         if [ -d "$mod_path/$partition" ]; then
             find "$mod_path/$partition" -name "*.so" -type f 2>/dev/null | while read -r so_file; do
-                ksu_susfs add_sus_map "$so_file" 2>/dev/null
+                ksu_susfs add_sus_map "$so_file" < /dev/null 2>/dev/null
                 $VERBOSE && echo "  [SUS_MAP] $so_file" >> "$LOG_FILE"
             done
         fi
@@ -255,10 +255,10 @@ register_module_vfs() {
 
                     if [ -c "$real_path" ]; then
                         $VERBOSE && echo "  [VFS] Whiteout: $virtual_path" >> "$LOG_FILE"
-                        "$LOADER" add "$virtual_path" "/nonexistent" 2>/dev/null
+                        "$LOADER" add "$virtual_path" "/nonexistent" < /dev/null 2>/dev/null
                     else
                         $VERBOSE && echo "  [VFS] Inject: $virtual_path" >> "$LOG_FILE"
-                        "$LOADER" add "$virtual_path" "$real_path" 2>/dev/null
+                        "$LOADER" add "$virtual_path" "$real_path" < /dev/null 2>/dev/null
                     fi
                 done
             )

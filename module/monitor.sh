@@ -84,9 +84,9 @@ register_new_module() {
                         virtual_path="/$relative_path"
 
                         if [ -c "$real_path" ]; then
-                            "$LOADER" add "$virtual_path" "/nonexistent" 2>/dev/null
+                            "$LOADER" add "$virtual_path" "/nonexistent" < /dev/null 2>/dev/null
                         else
-                            "$LOADER" add "$virtual_path" "$real_path" 2>/dev/null
+                            "$LOADER" add "$virtual_path" "$real_path" < /dev/null 2>/dev/null
                         fi
                     done
                 )
