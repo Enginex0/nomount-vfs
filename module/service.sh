@@ -105,6 +105,25 @@ find_module_for_overlay() {
 }
 
 # ============================================================
+# FUNCTION: Register .so files with SUSFS sus_map for /proc/maps hiding
+# ============================================================
+register_sus_map_for_module() {
+    local mod_path="$1"
+    local mod_name="$2"
+
+    command -v ksu_susfs >/dev/null 2>&1 || return
+
+    for partition in $TARGET_PARTITIONS; do
+        if [ -d "$mod_path/$partition" ]; then
+            find "$mod_path/$partition" -name "*.so" -type f 2>/dev/null | while read -r so_file; do
+                ksu_susfs add_sus_map "$so_file" 2>/dev/null
+                $VERBOSE && echo "  [SUS_MAP] $so_file" >> "$LOG_FILE"
+            done
+        fi
+    done
+}
+
+# ============================================================
 # FUNCTION: Register files from a module directory via VFS
 # ============================================================
 register_module_vfs() {
@@ -130,6 +149,8 @@ register_module_vfs() {
             )
         fi
     done
+
+    register_sus_map_for_module "$mod_path" "$mod_name"
 }
 
 # ============================================================
