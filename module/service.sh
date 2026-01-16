@@ -1,7 +1,7 @@
 #!/bin/sh
 # NoMount Universal Hijacker - service.sh
 # LATE BOOT PHASE: VFS registration (KPM should be loaded by now)
-# Non-blocking check - if /dev/nomount unavailable, skip gracefully
+# Non-blocking check - if /dev/vfs_helper unavailable, skip gracefully
 
 MODDIR=${0%/*}
 LOADER="$MODDIR/bin/nm"
@@ -10,7 +10,8 @@ NOMOUNT_DATA="/data/adb/nomount"
 LOG_FILE="$NOMOUNT_DATA/nomount.log"
 CONFIG_FILE="$NOMOUNT_DATA/config.sh"
 VERBOSE_FLAG="$NOMOUNT_DATA/.verbose"
-TARGET_PARTITIONS="system vendor product system_ext odm oem"
+# Expanded partition list (matching Mountify's coverage)
+TARGET_PARTITIONS="system vendor product system_ext odm oem mi_ext my_heytap prism optics oem_dlkm system_dlkm vendor_dlkm"
 
 # Counters
 ACTIVE_MODULES_COUNT=0
@@ -27,6 +28,8 @@ universal_hijack=true
 aggressive_mode=false
 monitor_new_modules=true
 excluded_modules=""
+skip_hosts_modules=true
+skip_nomount_marker=true
 
 [ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
 
@@ -35,10 +38,35 @@ VERBOSE=false
 [ -f "$VERBOSE_FLAG" ] && VERBOSE=true
 
 # ============================================================
-# NON-BLOCKING CHECK: Is /dev/nomount available?
+# FUNCTION: Detect root framework
 # ============================================================
-if [ ! -c "/dev/nomount" ]; then
-    echo "[INFO] /dev/nomount not available - VFS registration skipped" >> "$LOG_FILE"
+detect_framework() {
+    if [ -d "/data/adb/ksu" ] && [ -f "/data/adb/ksu/modules.img" ]; then
+        echo "kernelsu"
+    elif [ -d "/data/adb/ap" ]; then
+        echo "apatch"
+    elif [ -d "/data/adb/magisk" ]; then
+        echo "magisk"
+    else
+        echo "unknown"
+    fi
+}
+
+FRAMEWORK=$(detect_framework)
+echo "[INFO] Detected framework: $FRAMEWORK" >> "$LOG_FILE"
+
+# APatch-specific handling
+if [ "$FRAMEWORK" = "apatch" ]; then
+    # APatch uses slightly different paths in some versions
+    [ -d "/data/adb/ap/modules" ] && MODULES_DIR="/data/adb/ap/modules"
+    echo "[INFO] APatch mode - using modules dir: $MODULES_DIR" >> "$LOG_FILE"
+fi
+
+# ============================================================
+# NON-BLOCKING CHECK: Is /dev/vfs_helper available?
+# ============================================================
+if [ ! -c "/dev/vfs_helper" ]; then
+    echo "[INFO] /dev/vfs_helper not available - VFS registration skipped" >> "$LOG_FILE"
     echo "[INFO] Module will work normally on next boot when KPM is loaded" >> "$LOG_FILE"
     echo "[INFO] Continuing without VFS..." >> "$LOG_FILE"
 
@@ -47,43 +75,130 @@ if [ ! -c "/dev/nomount" ]; then
     exit 0
 fi
 
-echo "[OK] /dev/nomount ready - proceeding with VFS registration" >> "$LOG_FILE"
+echo "[OK] /dev/vfs_helper ready - proceeding with VFS registration" >> "$LOG_FILE"
 
 # ============================================================
-# HIDE /dev/nomount FROM NON-ROOT DETECTION APPS
+# HIDE /dev/vfs_helper FROM NON-ROOT DETECTION APPS
 # ============================================================
 # Kernel-level hiding returns ENOENT for non-root open() calls
 # SUSFS sus_path provides additional protection (hides from readdir too)
 if command -v ksu_susfs >/dev/null 2>&1; then
-    ksu_susfs add_sus_path /dev/nomount 2>/dev/null
-    echo "[HIDE] /dev/nomount hidden via SUSFS sus_path" >> "$LOG_FILE"
+    ksu_susfs add_sus_path /dev/vfs_helper 2>/dev/null
+    echo "[HIDE] /dev/vfs_helper hidden via SUSFS sus_path" >> "$LOG_FILE"
 else
-    echo "[HIDE] /dev/nomount protected by kernel-level hiding (SUSFS not available)" >> "$LOG_FILE"
+    echo "[HIDE] /dev/vfs_helper protected by kernel-level hiding (SUSFS not available)" >> "$LOG_FILE"
 fi
 
 echo "" >> "$LOG_FILE"
 
 # ============================================================
-# FUNCTION: Check if module is excluded
+# FUNCTION: Check if module is excluded (by name)
 # ============================================================
 is_excluded() {
-    local mod_name="$1"
-    echo "$excluded_modules" | grep -q "$mod_name" && return 0
+    mod_name="$1"
+    # Use -w for portable word matching instead of \b
+    echo "$excluded_modules" | grep -qw "$mod_name" && return 0
     return 1
 }
 
 # ============================================================
-# FUNCTION: Detect overlay mounts on target partitions
+# FUNCTION: Content-aware module filtering
+# Returns 0 if module should be skipped, 1 otherwise
 # ============================================================
-detect_overlay_mounts() {
-    echo "[HIJACK] Scanning for overlay mounts..." >> "$LOG_FILE"
+should_skip_module() {
+    local mod_path="$1"
+    local mod_name="$2"
 
+    # Check for skip_nomount marker
+    if [ "$skip_nomount_marker" = "true" ] && [ -f "$mod_path/skip_nomount" ]; then
+        echo "  [SKIP] $mod_name has skip_nomount marker" >> "$LOG_FILE"
+        return 0
+    fi
+
+    # Check for hosts file modification (detection risk)
+    if [ "$skip_hosts_modules" = "true" ]; then
+        for partition in $TARGET_PARTITIONS; do
+            if [ -f "$mod_path/$partition/etc/hosts" ]; then
+                echo "  [SKIP] $mod_name modifies /etc/hosts (detection risk)" >> "$LOG_FILE"
+                return 0
+            fi
+        done
+    fi
+
+    return 1
+}
+
+# ============================================================
+# FUNCTION: Detect ALL module-related mounts (universal hijacking)
+# Detects: overlay mounts, bind mounts, loop mounts, tmpfs
+# ============================================================
+detect_all_module_mounts() {
+    echo "[HIJACK] Scanning for ALL module-related mounts..." >> "$LOG_FILE"
+
+    # 1. Overlay mounts on target partitions
     while read -r device mountpoint fstype options rest; do
         if [ "$fstype" = "overlay" ]; then
             for partition in $TARGET_PARTITIONS; do
                 if echo "$mountpoint" | grep -q "^/$partition"; then
-                    echo "$mountpoint"
+                    echo "overlay:$mountpoint"
                     echo "[HIJACK] Found overlay: $mountpoint" >> "$LOG_FILE"
+                fi
+            done
+        fi
+    done < /proc/mounts
+
+    # 2. Bind mounts (source contains /data/adb/modules)
+    while read -r device mountpoint fstype options rest; do
+        if echo "$options" | grep -q "bind"; then
+            if echo "$device" | grep -q "/data/adb/modules"; then
+                echo "bind:$mountpoint"
+                echo "[HIJACK] Found bind mount: $mountpoint (source: $device)" >> "$LOG_FILE"
+            fi
+        fi
+    done < /proc/mounts
+
+    # 3. Check for bind mounts via same device/inode on target partitions
+    # These may not have explicit bind option
+    while read -r device mountpoint fstype options rest; do
+        for partition in $TARGET_PARTITIONS; do
+            if echo "$mountpoint" | grep -q "^/$partition" && [ "$fstype" != "overlay" ]; then
+                # Check if this is a hidden bind mount from modules
+                if [ -d "$MODULES_DIR" ]; then
+                    for mod_dir in "$MODULES_DIR"/*; do
+                        [ -d "$mod_dir" ] || continue
+                        if [ -d "$mod_dir$mountpoint" ]; then
+                            real_dev=$(stat -c %d "$mod_dir$mountpoint" 2>/dev/null)
+                            mount_dev=$(stat -c %d "$mountpoint" 2>/dev/null)
+                            if [ "$real_dev" = "$mount_dev" ] && [ -n "$real_dev" ]; then
+                                echo "bind:$mountpoint"
+                                echo "[HIJACK] Found hidden bind: $mountpoint" >> "$LOG_FILE"
+                            fi
+                        fi
+                    done
+                fi
+            fi
+        done
+    done < /proc/mounts
+
+    # 4. Loop mounts from module paths
+    if command -v losetup >/dev/null 2>&1; then
+        losetup -a 2>/dev/null | grep -E "modules|magisk" | while read -r loop_line; do
+            loop_dev=$(echo "$loop_line" | cut -d: -f1)
+            if grep -q "^$loop_dev " /proc/mounts; then
+                loop_mount=$(grep "^$loop_dev " /proc/mounts | awk '{print $2}')
+                echo "loop:$loop_mount"
+                echo "[HIJACK] Found loop mount: $loop_mount (device: $loop_dev)" >> "$LOG_FILE"
+            fi
+        done
+    fi
+
+    # 5. tmpfs at suspicious locations (may be used by some modules)
+    while read -r device mountpoint fstype options rest; do
+        if [ "$fstype" = "tmpfs" ]; then
+            for partition in $TARGET_PARTITIONS; do
+                if echo "$mountpoint" | grep -q "^/$partition"; then
+                    echo "tmpfs:$mountpoint"
+                    echo "[HIJACK] Found tmpfs: $mountpoint" >> "$LOG_FILE"
                 fi
             done
         fi
@@ -154,14 +269,40 @@ register_module_vfs() {
 }
 
 # ============================================================
-# FUNCTION: Hijack a single overlay mount
+# FUNCTION: Hijack a single mount (any type)
 # ============================================================
-hijack_overlay() {
-    local mountpoint="$1"
+hijack_mount() {
+    local mount_info="$1"
+    local mount_type="${mount_info%%:*}"
+    local mountpoint="${mount_info#*:}"
 
-    echo "[HIJACK] Processing: $mountpoint" >> "$LOG_FILE"
+    echo "[HIJACK] Processing $mount_type mount: $mountpoint" >> "$LOG_FILE"
 
-    local mod_name=$(find_module_for_overlay "$mountpoint")
+    local mod_name=""
+
+    # Find owning module based on mount type
+    case "$mount_type" in
+        overlay)
+            mod_name=$(find_module_for_overlay "$mountpoint")
+            ;;
+        bind|loop|tmpfs)
+            # For non-overlay mounts, scan module directories
+            for mod_dir in "$MODULES_DIR"/*; do
+                [ -d "$mod_dir" ] || continue
+                local test_mod="${mod_dir##*/}"
+                for partition in $TARGET_PARTITIONS; do
+                    if [ -d "$mod_dir/$partition" ]; then
+                        # Check if this module has content for this mountpoint
+                        local relative="${mountpoint#/}"
+                        if [ -e "$mod_dir/$relative" ]; then
+                            mod_name="$test_mod"
+                            break 2
+                        fi
+                    fi
+                done
+            done
+            ;;
+    esac
 
     if [ -z "$mod_name" ]; then
         echo "  [WARN] Could not determine module for $mountpoint" >> "$LOG_FILE"
@@ -169,10 +310,15 @@ hijack_overlay() {
     fi
 
     local mod_path="$MODULES_DIR/$mod_name"
-    echo "  [INFO] Module: $mod_name" >> "$LOG_FILE"
+    echo "  [INFO] Module: $mod_name (type: $mount_type)" >> "$LOG_FILE"
 
     if is_excluded "$mod_name"; then
         echo "  [SKIP] Module is in exclusion list" >> "$LOG_FILE"
+        return 0
+    fi
+
+    # Content-aware filtering (skip hosts-modifying modules, skip_nomount markers)
+    if should_skip_module "$mod_path" "$mod_name"; then
         return 0
     fi
 
@@ -194,7 +340,7 @@ hijack_overlay() {
             echo "  [WARN] Unmount failed, aggressive mode - continuing" >> "$LOG_FILE"
             return 0
         else
-            echo "  [WARN] Unmount failed, keeping overlay as fallback" >> "$LOG_FILE"
+            echo "  [WARN] Unmount failed, keeping mount as fallback" >> "$LOG_FILE"
             return 1
         fi
     fi
@@ -216,6 +362,9 @@ process_modules_direct() {
 
         is_excluded "$mod_name" && continue
 
+        # Content-aware filtering
+        should_skip_module "$mod_path" "$mod_name" && continue
+
         has_content=false
         for partition in $TARGET_PARTITIONS; do
             [ -d "$mod_path/$partition" ] && has_content=true && break
@@ -236,20 +385,23 @@ process_modules_direct() {
 if [ "$universal_hijack" = "true" ]; then
     echo "========== UNIVERSAL HIJACKER MODE ==========" >> "$LOG_FILE"
 
-    # Phase 1: Detect and hijack existing overlay mounts
-    overlay_list=$(detect_overlay_mounts)
+    # Phase 1: Detect and hijack ALL existing mounts (overlay, bind, loop, tmpfs)
+    mount_list=$(detect_all_module_mounts)
 
-    if [ -n "$overlay_list" ]; then
+    if [ -n "$mount_list" ]; then
         echo "" >> "$LOG_FILE"
-        echo "[HIJACK] Hijacking detected overlays..." >> "$LOG_FILE"
+        echo "[HIJACK] Hijacking ALL detected mounts..." >> "$LOG_FILE"
 
-        echo "$overlay_list" | while read -r mountpoint; do
-            [ -n "$mountpoint" ] && hijack_overlay "$mountpoint"
-        done
+        # Use here-string to avoid subshell variable loss
+        while read -r mount_info; do
+            [ -n "$mount_info" ] && hijack_mount "$mount_info"
+        done <<EOF
+$mount_list
+EOF
 
         echo "[HIJACK] Complete" >> "$LOG_FILE"
     else
-        echo "[HIJACK] No overlay mounts detected" >> "$LOG_FILE"
+        echo "[HIJACK] No module-related mounts detected" >> "$LOG_FILE"
     fi
 
     # Phase 2: Process all modules directly via VFS
