@@ -1,7 +1,7 @@
 id=nomount
 metamodule=true
-name=NoMount Universal Hijacker
-version=v0.3.0
-versionCode=3
+name=NoMount VFS
+version=v0.4.0
+versionCode=4
 author=maxsteeel, Enginex0
-description=Universal Hijacker - VFS path redirection replaces all mounts
+description=Zero-mount-footprint file injection via VFS path redirection. Supports KernelSU, APatch, and Magisk.

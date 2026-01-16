@@ -32,4 +32,14 @@ monitor_new_modules=true
 # Example: excluded_modules="zygisk_lsposed,shamiko"
 excluded_modules=""
 
+# --- Content-aware filtering ---
+# Skip modules that modify /system/etc/hosts (DNS hijacking risk)
+# Injecting hosts files can be detected and causes issues
+# Default: true
+skip_hosts_modules=true
+
+# Support skip_nomount marker - modules can opt-out by creating this file
+# Default: true
+skip_nomount_marker=true
+
 # EOF
