@@ -4,8 +4,8 @@ VFS-level path redirection for KernelSU. Replaces overlay mounts with kernel VFS
 
 ## Requirements
 
-- Kernel compiled with `CONFIG_NOMOUNT=y`
-- KernelSU or APatch
+- Kernel compiled with `CONFIG_VFS_DCACHE_HELPER=y`
+- KernelSU, APatch, or Magisk
 - ARM64 device
 
 ## Installation
@@ -33,9 +33,10 @@ post-fs-data (early):
 └── Inject skip_mount into all modules (prevents KSU from mounting)
 
 service.sh (late boot):
-├── Check /dev/nomount availability
+├── Check /dev/vfs_helper availability
 ├── Register VFS redirections for all modules
-└── Hijack any existing overlay mounts
+├── Hijack any existing overlay/bind/loop/tmpfs mounts
+└── Hide device via SUSFS (if available)
 ```
 
 ## Configuration
