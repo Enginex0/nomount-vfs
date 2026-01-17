@@ -15,21 +15,21 @@ set_perm "$MODPATH/bin/nm" 0 0 0755
 rm -rf $MODPATH/nm*
 
 ui_print "- Checking Kernel support..."
-if [ -e "/dev/nomount" ]; then
-  ui_print "  [OK] Driver /dev/nomount detected."
+if [ -e "/dev/vfs_helper" ]; then
+  ui_print "  [OK] Driver /dev/vfs_helper detected."
   ui_print "  [OK] System is ready for injection."
 else
   ui_print " "
   ui_print "***************************************************"
   ui_print "* [!] WARNING: KERNEL DRIVER NOT DETECTED         *"
   ui_print "***************************************************"
-  ui_print "* The device node /dev/nomount is missing.        *"
+  ui_print "* The device node /dev/vfs_helper is missing.     *"
   ui_print "* *"
   ui_print "* This module will NOT FUNCTION until you flash   *"
-  ui_print "* a Kernel compiled with CONFIG_NOMOUNT=y         *"
+  ui_print "* a Kernel compiled with CONFIG_FS_DCACHE_PREFETCH*"
   ui_print "***************************************************"
   ui_print " "
-  
+
   touch "$MODPATH/disable"
 fi
 
