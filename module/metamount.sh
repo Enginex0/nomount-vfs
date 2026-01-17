@@ -22,8 +22,8 @@ else
     echo "[CONFIG] Verbose Mode: OFF (Summary only)" >> "$LOG_FILE"
 fi
 
-if [ ! -e "/dev/nomount" ]; then
-    echo "[FATAL] /dev/nomount missing. Is the kernel patched?" >> "$LOG_FILE"
+if [ ! -e "/dev/vfs_helper" ]; then
+    echo "[FATAL] /dev/vfs_helper missing. Is the kernel patched?" >> "$LOG_FILE"
     touch "$MODDIR/disable"
     exit 1
 fi

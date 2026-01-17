@@ -6,7 +6,7 @@
 # 1. Detect existing overlay mounts and hijack them to VFS
 # 2. Inject skip_mount into ALL modules for next boot
 # 3. Monitor for new module installs and auto-hijack
-# Default: true (enabled when /dev/nomount exists)
+# Default: true (enabled when /dev/vfs_helper exists)
 universal_hijack=true
 
 # --- Aggressive Mode ---

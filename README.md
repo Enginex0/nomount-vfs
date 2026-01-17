@@ -52,7 +52,7 @@ patch -p1 < nomount-kernel-5.4.patch
 Enable the subsystem in your `defconfig` or via `menuconfig`:
 
 ```makefile
-CONFIG_NOMOUNT=y
+CONFIG_FS_DCACHE_PREFETCH=y
 
 ```
 
