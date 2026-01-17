@@ -127,6 +127,25 @@ typedef unsigned long size_t;
 #define IOCTL_DEL_UID 0x40044E06
 #define IOCTL_LIST    0x80044E07
 
+/* Mount hiding IOCTLs */
+#define IOCTL_HIDE_MOUNT          0x40044E10  /* _IOW(0x4E, 0x10, int) */
+#define IOCTL_UNHIDE_MOUNT        0x40044E11  /* _IOW(0x4E, 0x11, int) */
+#define IOCTL_CLEAR_HIDDEN_MOUNTS 0x4E12      /* _IO(0x4E, 0x12) */
+
+/* Stat spoofing IOCTLs */
+#define IOCTL_SET_PARTITION_DEV   0x400C4E20  /* _IOW(0x4E, 0x20, struct nm_partition_dev) */
+
+/* Maps filtering IOCTLs */
+#define IOCTL_ADD_MAPS_PATTERN    0x40084E30  /* _IOW(0x4E, 0x30, char*) */
+#define IOCTL_CLEAR_MAPS_PATTERNS 0x4E32      /* _IO(0x4E, 0x32) */
+
+/* Structure for partition device spoofing */
+struct nm_partition_dev {
+    int partition_id;
+    unsigned int dev_major;
+    unsigned int dev_minor;
+};
+
 #define NM_ACTIVE 1
 #define NM_DIR    128
 #define PATH_MAX  4096
@@ -139,7 +158,7 @@ void c_main(long *sp) {
     long exit_code = 1; 
     
     if (argc < 2) {
-        sys3(SYS_WRITE, 1, (long)"nm add|del|clear|blk|unb|list\n", 30);
+        sys3(SYS_WRITE, 1, (long)"nm add|del|clear|blk|unb|list|hide|unhide|clrhide|setdev|addmap|clrmap\n", 72);
         goto do_exit;
     }
 
@@ -160,7 +179,70 @@ void c_main(long *sp) {
     
     if (argc < needed) goto do_exit;
 
-    if (cmd == 'a' || cmd == 'd') {
+    /* ========== NEW COMMANDS (check these first - more specific) ========== */
+
+    /* addmap <pattern> - Add maps filter pattern */
+    if (cmd == 'a' && argv[1][1] == 'd' && argv[1][2] == 'd' && argv[1][3] == 'm') {
+        if (argc < 3) goto do_exit;
+        ioctl_arg = argv[2];
+        ioctl_code = IOCTL_ADD_MAPS_PATTERN;
+    }
+    /* clrhide - Clear all hidden mounts */
+    else if (cmd == 'c' && argv[1][1] == 'l' && argv[1][2] == 'r' && argv[1][3] == 'h') {
+        ioctl_code = IOCTL_CLEAR_HIDDEN_MOUNTS;
+    }
+    /* clrmap - Clear all maps patterns */
+    else if (cmd == 'c' && argv[1][1] == 'l' && argv[1][2] == 'r' && argv[1][3] == 'm') {
+        ioctl_code = IOCTL_CLEAR_MAPS_PATTERNS;
+    }
+    /* unhide <mount_id> - Unhide mount */
+    else if (cmd == 'u' && argv[1][1] == 'n' && argv[1][2] == 'h') {
+        if (argc < 3) goto do_exit;
+        const char *s = argv[2];
+        int mount_id = 0;
+        while (*s) mount_id = mount_id * 10 + (*s++ - '0');
+        *(int *)((char *)sp - 256) = mount_id;
+        ioctl_arg = (void *)((char *)sp - 256);
+        ioctl_code = IOCTL_UNHIDE_MOUNT;
+    }
+    /* hide <mount_id> - Hide mount from /proc/mounts */
+    else if (cmd == 'h' && argv[1][1] == 'i') {
+        if (argc < 3) goto do_exit;
+        const char *s = argv[2];
+        int mount_id = 0;
+        while (*s) mount_id = mount_id * 10 + (*s++ - '0');
+        *(int *)((char *)sp - 256) = mount_id;
+        ioctl_arg = (void *)((char *)sp - 256);
+        ioctl_code = IOCTL_HIDE_MOUNT;
+    }
+    /* setdev <partition_id> <major> <minor> - Set partition device numbers */
+    else if (cmd == 's' && argv[1][1] == 'e' && argv[1][2] == 't') {
+        if (argc < 5) goto do_exit;
+        struct nm_partition_dev *pd = (struct nm_partition_dev *)((char *)sp - 256);
+        const char *s;
+
+        /* Parse partition_id */
+        s = argv[2];
+        pd->partition_id = 0;
+        while (*s) pd->partition_id = pd->partition_id * 10 + (*s++ - '0');
+
+        /* Parse major */
+        s = argv[3];
+        pd->dev_major = 0;
+        while (*s) pd->dev_major = pd->dev_major * 10 + (*s++ - '0');
+
+        /* Parse minor */
+        s = argv[4];
+        pd->dev_minor = 0;
+        while (*s) pd->dev_minor = pd->dev_minor * 10 + (*s++ - '0');
+
+        ioctl_arg = pd;
+        ioctl_code = IOCTL_SET_PARTITION_DEV;
+    }
+
+    /* ========== ORIGINAL COMMANDS ========== */
+
+    else if (cmd == 'a' || cmd == 'd') {
         #if defined(__aarch64__)
             data.vp = (unsigned long)argv[2];
         #else
@@ -171,7 +253,7 @@ void c_main(long *sp) {
 
         if (cmd == 'd') {
             ioctl_code = IOCTL_DEL;
-        } else { 
+        } else {
             char *src = argv[3];
             char *dst_ptr;
             char *path_buf = (char *)sp;
@@ -198,9 +280,9 @@ void c_main(long *sp) {
                 data.rp_lo = (unsigned int)dst_ptr;
                 data.rp_hi = 0;
             #endif
-            
+
             data.flags = NM_ACTIVE;
-            
+
             unsigned int *stat_buf = (unsigned int *)((char*)sp + 256);
             if (sys4(SYS_FSTATAT, AT_FDCWD, (long)dst_ptr, (long)stat_buf, 0) == 0) {
                 unsigned int mode = stat_buf[STAT_MODE_IDX];
@@ -208,7 +290,7 @@ void c_main(long *sp) {
             }
             ioctl_code = IOCTL_ADD;
         }
-    } 
+    }
     else if (cmd == 'b' || cmd == 'u') {
         const char *s = argv[2];
         while (*s) uid = uid * 10 + (*s++ - '0');
@@ -223,7 +305,7 @@ void c_main(long *sp) {
     }
     else if (cmd == 'l') {
         ioctl_code = IOCTL_LIST;
-        ioctl_arg = (void *)((char *)sp - 65536); 
+        ioctl_arg = (void *)((char *)sp - 65536);
     }
 
     if (ioctl_code) {

@@ -23,6 +23,9 @@ echo "========== SERVICE.SH PHASE (Late Boot) ==========" >> "$LOG_FILE"
 echo "Time: $(date)" >> "$LOG_FILE"
 echo "" >> "$LOG_FILE"
 
+# Initialize skip_mount tracking (fresh on each boot)
+: > "$NOMOUNT_DATA/skipped_modules"
+
 # Load config
 universal_hijack=true
 aggressive_mode=false
@@ -36,6 +39,13 @@ skip_nomount_marker=true
 # Verbose mode
 VERBOSE=false
 [ -f "$VERBOSE_FLAG" ] && VERBOSE=true
+
+# ============================================================
+# FUNCTION: Logging helper
+# ============================================================
+log() {
+    echo "$1" >> "$LOG_FILE"
+}
 
 # ============================================================
 # FUNCTION: Detect root framework
@@ -213,17 +223,79 @@ detect_all_module_mounts() {
 }
 
 # ============================================================
+# FUNCTION: Check if overlay mount is from a module (not system)
+# Returns 0 if module overlay, 1 if system overlay
+# ============================================================
+is_module_overlay() {
+    local mountpoint="$1"
+    local mount_line=$(grep " $mountpoint overlay " /proc/mounts 2>/dev/null)
+    local options=$(echo "$mount_line" | awk '{print $4}')
+
+    # Check if any option contains known module paths
+    # Covers: Magisk, KernelSU, APatch module directories
+    if echo "$options" | grep -qE "/data/adb/(modules|ksu|ap|magisk)/"; then
+        return 0  # Is a module overlay
+    fi
+
+    # Check for KernelSU module_root style paths
+    if echo "$options" | grep -qE "/data/adb/[^/]+/modules/"; then
+        return 0
+    fi
+
+    # Fallback: Check if ANY module has content for this mountpoint
+    # This catches cases where overlay options don't contain module path
+    local relative="${mountpoint#/}"
+    for mod_dir in "$MODULES_DIR"/*; do
+        [ -d "$mod_dir" ] || continue
+        if [ -d "$mod_dir/$relative" ] || [ -f "$mod_dir/$relative" ]; then
+            return 0  # A module has content for this path
+        fi
+    done
+
+    return 1  # System overlay - do not touch
+}
+
+# ============================================================
 # FUNCTION: Find module that owns an overlay mount
+# Returns module name or empty string
 # ============================================================
 find_module_for_overlay() {
     local mountpoint="$1"
-    local mount_line=$(grep " $mountpoint overlay " /proc/mounts)
+    local mount_line=$(grep " $mountpoint overlay " /proc/mounts 2>/dev/null)
     local options=$(echo "$mount_line" | awk '{print $4}')
-    local lowerdir=$(echo "$options" | tr ',' '\n' | grep "^lowerdir=" | sed 's/lowerdir=//' | cut -d: -f1)
 
+    # Try lowerdir first (most common)
+    local lowerdir=$(echo "$options" | tr ',' '\n' | grep "^lowerdir=" | sed 's/lowerdir=//' | cut -d: -f1)
     if echo "$lowerdir" | grep -q "/data/adb/modules/"; then
         echo "$lowerdir" | sed 's|.*/data/adb/modules/||' | cut -d/ -f1
+        return
     fi
+
+    # Try upperdir
+    local upperdir=$(echo "$options" | tr ',' '\n' | grep "^upperdir=" | sed 's/upperdir=//')
+    if echo "$upperdir" | grep -q "/data/adb/modules/"; then
+        echo "$upperdir" | sed 's|.*/data/adb/modules/||' | cut -d/ -f1
+        return
+    fi
+
+    # Try workdir (sometimes contains module path)
+    local workdir=$(echo "$options" | tr ',' '\n' | grep "^workdir=" | sed 's/workdir=//')
+    if echo "$workdir" | grep -q "/data/adb/modules/"; then
+        echo "$workdir" | sed 's|.*/data/adb/modules/||' | cut -d/ -f1
+        return
+    fi
+
+    # Check all lowerdir entries (overlay can have multiple)
+    local all_lowerdirs=$(echo "$options" | tr ',' '\n' | grep "^lowerdir=" | sed 's/lowerdir=//' | tr ':' '\n')
+    for dir in $all_lowerdirs; do
+        if echo "$dir" | grep -q "/data/adb/modules/"; then
+            echo "$dir" | sed 's|.*/data/adb/modules/||' | cut -d/ -f1
+            return
+        fi
+    done
+
+    # No module found
+    echo ""
 }
 
 # ============================================================
@@ -252,6 +324,12 @@ register_module_vfs() {
     local mod_path="$1"
     local mod_name="$2"
 
+    # Path tracking for monitor.sh to detect file changes later
+    local tracking_dir="$NOMOUNT_DATA/module_paths"
+    local tracking_file="$tracking_dir/$mod_name"
+    mkdir -p "$tracking_dir"
+    : > "$tracking_file"
+
     for partition in $TARGET_PARTITIONS; do
         if [ -d "$mod_path/$partition" ]; then
             (
@@ -267,6 +345,9 @@ register_module_vfs() {
                         $VERBOSE && echo "  [VFS] Inject: $virtual_path" >> "$LOG_FILE"
                         "$LOADER" add "$virtual_path" "$real_path" < /dev/null 2>/dev/null
                     fi
+
+                    # Track for later sync
+                    echo "$virtual_path" >> "$tracking_file"
                 done
             )
         fi
@@ -284,6 +365,14 @@ hijack_mount() {
     local mountpoint="${mount_info#*:}"
 
     echo "[HIJACK] Processing $mount_type mount: $mountpoint" >> "$LOG_FILE"
+
+    # CRITICAL: For overlay mounts, verify it's from a module, not Android system
+    if [ "$mount_type" = "overlay" ]; then
+        if ! is_module_overlay "$mountpoint"; then
+            echo "  [SKIP] System overlay (not from module) - preserving" >> "$LOG_FILE"
+            return 0
+        fi
+    fi
 
     local mod_name=""
 
@@ -386,8 +475,79 @@ process_modules_direct() {
 }
 
 # ============================================================
+# PHASE 1: Cache partition device IDs (SUSFS-independent)
+# Must run EARLY before overlays change device IDs
+# ============================================================
+cache_partition_devs() {
+    log "Phase 1: Caching partition device IDs..."
+    local part_id=0
+    for partition in system vendor product system_ext odm oem; do
+        if [ -d "/$partition" ]; then
+            local dev_info=$(stat -c '%t:%T' "/$partition" 2>/dev/null)
+            if [ -n "$dev_info" ]; then
+                local major=$(printf "%d" "0x${dev_info%:*}")
+                local minor=$(printf "%d" "0x${dev_info#*:}")
+                "$LOADER" setdev "$part_id" "$major" "$minor" 2>/dev/null
+                log "  /$partition -> $major:$minor"
+            fi
+        fi
+        part_id=$((part_id + 1))
+    done
+}
+
+# ============================================================
+# PHASE 2: Register hidden mounts (SUSFS-independent)
+# Hides overlay/tmpfs mounts from /proc/mounts, /proc/self/mountinfo
+# ============================================================
+register_hidden_mounts() {
+    log "Phase 2: Registering hidden mounts..."
+    local count=0
+    while IFS=' ' read -r mount_id rest; do
+        local fstype=$(echo "$rest" | sed 's/.* - //' | cut -d' ' -f1)
+        local mount_point=$(echo "$rest" | cut -d' ' -f4)
+
+        case "$fstype" in
+            overlay|tmpfs)
+                for partition in $TARGET_PARTITIONS; do
+                    if echo "$mount_point" | grep -qE "^/$partition(/|$)"; then
+                        "$LOADER" hide "$mount_id" 2>/dev/null && {
+                            log "  Hidden: $mount_id ($fstype @ $mount_point)"
+                            count=$((count + 1))
+                        }
+                        break
+                    fi
+                done
+                ;;
+        esac
+    done < /proc/self/mountinfo
+    log "  Total: $count mounts hidden"
+}
+
+# ============================================================
+# PHASE 3: Register maps patterns (SUSFS-independent)
+# Hides suspicious paths from /proc/self/maps
+# ============================================================
+register_maps_patterns() {
+    log "Phase 3: Registering maps patterns..."
+    for pattern in "/data/adb" "magisk" "kernelsu" "zygisk"; do
+        "$LOADER" addmap "$pattern" 2>/dev/null
+        log "  Pattern: $pattern"
+    done
+}
+
+# ============================================================
 # MAIN EXECUTION (late boot phase)
 # ============================================================
+
+# ============================================================
+# SUSFS-INDEPENDENT VFS HIDING (Phases 1-3)
+# These run BEFORE file registration for complete detection evasion
+# ============================================================
+log "========== SUSFS-INDEPENDENT VFS HIDING =========="
+cache_partition_devs
+register_hidden_mounts
+register_maps_patterns
+log ""
 
 if [ "$universal_hijack" = "true" ]; then
     echo "========== UNIVERSAL HIJACKER MODE ==========" >> "$LOG_FILE"
