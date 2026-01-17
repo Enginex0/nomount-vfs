@@ -135,23 +135,21 @@ async function loadHome() {
 
 async function loadModules() {
     const listContainer = document.getElementById('modules-list');
-    const emptyBanner = document.getElementById('modules-empty');
-    
+
     const script = `
         active_rules=$(${NM_BIN} list)
-        
+
         cd ${MOD_DIR}
         for mod in *; do
             if [ ! -d "$mod" ] || [ "$mod" = "nomount" ]; then continue; fi
             if [ -d "$mod/system" ] || [ -d "$mod/vendor" ] || \
                [ -d "$mod/product" ] || [ -d "$mod/system_ext" ] || \
                [ -d "$mod/oem" ] || [ -d "$mod/odm" ]; then
-               
+
                name=$(grep "^name=" "$mod/module.prop" | head -n1 | cut -d= -f2-)
                if [ -f "$mod/disable" ]; then enabled="false"; else enabled="true"; fi
 
-               file_list=$(find "$mod/system" "$mod/vendor" "$mod/product" "$mod/system_ext" -type f 2>/dev/null)
-               potential_count=$(echo "$file_list" | wc -l)
+               potential_count=$(find "$mod/system" "$mod/vendor" "$mod/product" "$mod/system_ext" \\( -type f -o -type c \\) 2>/dev/null | wc -l)
 
                if echo "$active_rules" | grep -qF "${MOD_DIR}/$mod/"; then
                    is_loaded="true"
@@ -160,7 +158,7 @@ async function loadModules() {
                    is_loaded="false"
                    count=0
                fi
-               
+
                echo "$mod|$name|$enabled|$count|$is_loaded"
             fi
         done
@@ -169,9 +167,10 @@ async function loadModules() {
     try {
         const result = await exec(script);
         const lines = result.stdout.split('\n').filter(line => line.trim() !== '');
-        
-        listContainer.innerHTML = '';
-        listContainer.appendChild(emptyBanner);
+
+        // Recreate empty banner element (fix for appendChild null error)
+        listContainer.innerHTML = '<div class="inactive-banner" id="modules-empty">No injecting modules found</div>';
+        const emptyBanner = document.getElementById('modules-empty');
 
         if (lines.length === 0) {
             emptyBanner.classList.add('active');
@@ -270,10 +269,14 @@ async function loadModule(modId) {
         cd ${MOD_DIR}/${modId}
         for part in system vendor product system_ext oem odm; do
             if [ -d "$part" ]; then
-                find "$part" -type f | while read -r file; do
+                find "$part" \\( -type f -o -type c \\) | while read -r file; do
                     target="/$file"
                     source="${MOD_DIR}/${modId}/$file"
-                    ${NM_BIN} add "$target" "$source"
+                    if [ -c "$source" ]; then
+                        ${NM_BIN} add "$target" "/nonexistent"
+                    else
+                        ${NM_BIN} add "$target" "$source"
+                    fi
                 done
             fi
         done
