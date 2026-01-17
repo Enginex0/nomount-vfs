@@ -214,7 +214,7 @@ async function loadModules() {
                 </div>
             `;
 
-            const toggle = card.querySelector(`#switch-${modId}`);
+            const toggle = card.querySelector(`[id="switch-${modId}"]`);
             toggle.addEventListener('change', async () => {
                 toggle.disabled = true;
                 try {
@@ -234,7 +234,7 @@ async function loadModules() {
                 }
             });
 
-            const hotBtn = card.querySelector(`#btn-hot-${modId}`);
+            const hotBtn = card.querySelector(`[id="btn-hot-${modId}"]`);
             hotBtn.addEventListener('click', async () => {
                 hotBtn.textContent = "...";
                 hotBtn.disabled = true;
