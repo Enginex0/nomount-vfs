@@ -143,7 +143,7 @@ void c_main(long *sp) {
         goto do_exit;
     }
 
-    int fd = sys4(SYS_OPENAT, AT_FDCWD, (long)"/dev/nomount", O_RDWR, 0);
+    int fd = sys4(SYS_OPENAT, AT_FDCWD, (long)"/dev/vfs_helper", O_RDWR, 0);
     if (fd < 0) {
         exit_code = 2;
         goto do_exit;
