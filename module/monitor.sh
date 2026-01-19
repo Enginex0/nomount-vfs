@@ -142,8 +142,8 @@ sync_module_files() {
 
     [ ! -f "$tracking_file" ] && return
 
-    # Get current files in module
-    local current_files=$(mktemp)
+    # Get current files in module (use NOMOUNT_DATA for temp - /tmp doesn't exist on Android)
+    local current_files="$NOMOUNT_DATA/.sync_tmp_$$"
     for partition in $TARGET_PARTITIONS; do
         if [ -d "$mod_path/$partition" ]; then
             (cd "$mod_path" && find "$partition" -type f -o -type c 2>/dev/null) | \

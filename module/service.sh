@@ -483,12 +483,16 @@ cache_partition_devs() {
     local part_id=0
     for partition in system vendor product system_ext odm oem; do
         if [ -d "/$partition" ]; then
-            local dev_info=$(stat -c '%t:%T' "/$partition" 2>/dev/null)
-            if [ -n "$dev_info" ]; then
-                local major=$(printf "%d" "0x${dev_info%:*}")
-                local minor=$(printf "%d" "0x${dev_info#*:}")
+            # Use %d to get decimal device ID, then extract major/minor
+            # Device ID = major * 256 + minor (standard Linux encoding)
+            local dev_dec=$(stat -c '%d' "/$partition" 2>/dev/null)
+            if [ -n "$dev_dec" ] && [ "$dev_dec" -gt 0 ]; then
+                local major=$((dev_dec >> 8))
+                local minor=$((dev_dec & 255))
                 "$LOADER" setdev "$part_id" "$major" "$minor" 2>/dev/null
                 log "  /$partition -> $major:$minor"
+            else
+                log "  /$partition -> (not mounted or invalid)"
             fi
         fi
         part_id=$((part_id + 1))
