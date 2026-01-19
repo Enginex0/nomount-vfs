@@ -154,6 +154,15 @@ index 000000000..43ca3f0fa
 +#include <linux/susfs_def.h>
 +#endif
 +
++/* Debug logging control - set via boot param or sysfs */
++static int nomount_debug = 1;  /* 0=off, 1=errors, 2=info, 3=verbose */
++#define NM_ERR(fmt, ...) \
++	do { if (nomount_debug >= 1) pr_err("nomount: " fmt, ##__VA_ARGS__); } while(0)
++#define NM_INFO(fmt, ...) \
++	do { if (nomount_debug >= 2) pr_info("nomount: " fmt, ##__VA_ARGS__); } while(0)
++#define NM_DBG(fmt, ...) \
++	do { if (nomount_debug >= 3) pr_debug("nomount: " fmt, ##__VA_ARGS__); } while(0)
++
 +DEFINE_HASHTABLE(nomount_rules_ht, NOMOUNT_HASH_BITS);
 +DEFINE_HASHTABLE(nomount_dirs_ht, NOMOUNT_HASH_BITS);
 +DEFINE_HASHTABLE(nomount_uid_ht, NOMOUNT_HASH_BITS);
@@ -278,16 +287,23 @@ index 000000000..43ca3f0fa
 +	if (nomount_is_uid_blocked(current_uid().val))
 +		return false;
 +
++	NM_DBG("hide_map: checking %s\n", file_path);
++
 +	/* Check default patterns */
 +	for (i = 0; nm_default_maps_patterns[i] != NULL; i++) {
-+		if (strstr(file_path, nm_default_maps_patterns[i]) != NULL)
++		if (strstr(file_path, nm_default_maps_patterns[i]) != NULL) {
++			NM_INFO("hide_map: hiding %s (matched default pattern: %s)\n",
++				file_path, nm_default_maps_patterns[i]);
 +			return true;
++		}
 +	}
 +
 +	/* Check user-registered patterns */
 +	rcu_read_lock();
 +	hash_for_each_rcu(nomount_maps_patterns_ht, bkt, p, node) {
 +		if (strstr(file_path, p->pattern) != NULL) {
++			NM_INFO("hide_map: hiding %s (matched user pattern: %s)\n",
++				file_path, p->pattern);
 +			rcu_read_unlock();
 +			return true;
 +		}
@@ -434,12 +450,24 @@ index 000000000..43ca3f0fa
 +	if (!inode || NOMOUNT_DISABLED()) return NULL;
 +	if (nomount_is_uid_blocked(current_uid().val)) return NULL;
 +
++	NM_DBG("get_vpath: lookup ino=%lu dev=%u\n", inode->i_ino, inode->i_sb->s_dev);
++
 +	rcu_read_lock();
 +	hash_for_each_rcu(nomount_rules_ht, bkt, rule, node) {
-+		if (rule->real_ino != 0 && rule->real_ino == inode->i_ino) {
-+			if (rule->is_new) {
-+				found_path = kstrdup(rule->virtual_path, GFP_ATOMIC);
-+				/* kstrdup may return NULL on OOM - callers handle NULL returns */
++		/* Check both inode AND device to avoid cross-filesystem collision */
++		if (rule->real_ino != 0 && rule->real_ino == inode->i_ino &&
++		    rule->real_dev == inode->i_sb->s_dev) {
++			/*
++			 * Always return virtual path for redirected files.
++			 * This fixes /proc/self/fd symlink resolution leak where
++			 * readlink() would reveal the real path instead of virtual.
++			 * Removed is_new check - we want virtual path for ALL redirects.
++			 */
++			found_path = kstrdup(rule->virtual_path, GFP_ATOMIC);
++			if (found_path) {
++				NM_INFO("get_vpath: ino=%lu -> %s\n", inode->i_ino, found_path);
++			} else {
++				NM_ERR("get_vpath: kstrdup failed for %s\n", rule->virtual_path);
 +			}
 +			break;
 +		}
@@ -572,6 +600,7 @@ index 000000000..43ca3f0fa
 +
 +	if ((nm_ino_adb != 0 && inode->i_ino == nm_ino_adb) ||
 +		(nm_ino_modules != 0 && inode->i_ino == nm_ino_modules)) {
++		NM_DBG("is_traversal_allowed: allowing traversal for ino=%lu\n", inode->i_ino);
 +		return true;
 +	}
 +	return false;
@@ -584,9 +613,14 @@ index 000000000..43ca3f0fa
 +	bool match = false;
 +	if (!inode || NOMOUNT_DISABLED()) return false;
 +
++	NM_DBG("is_injected: checking ino=%lu dev=%u\n", inode->i_ino, inode->i_sb->s_dev);
++
 +	rcu_read_lock();
 +	hash_for_each_rcu(nomount_rules_ht, bkt, rule, node) {
-+		if (rule->real_ino != 0 && rule->real_ino == inode->i_ino) {
++		/* Check both inode AND device to avoid cross-filesystem collision */
++		if (rule->real_ino != 0 && rule->real_ino == inode->i_ino &&
++		    rule->real_dev == inode->i_sb->s_dev) {
++			NM_DBG("is_injected: matched ino=%lu vpath=%s\n", inode->i_ino, rule->virtual_path);
 +			match = true;
 +			break;
 +		}
@@ -601,6 +635,12 @@ index 000000000..43ca3f0fa
 +{
 +	struct nomount_rule *rule;
 +	int bkt;
++	char *vpath_copy = NULL;
++	dev_t matched_dev = 0;
++	ino_t matched_vino = 0;
++	dev_t orig_dev;
++	ino_t orig_ino;
++	bool found = false;
 +
 +	if (!inode || NOMOUNT_DISABLED())
 +		return;
@@ -608,27 +648,58 @@ index 000000000..43ca3f0fa
 +	if (nomount_is_uid_blocked(current_uid().val))
 +		return;
 +
++	NM_DBG("spoof_stat: checking ino=%lu dev=%u\n", inode->i_ino, inode->i_sb->s_dev);
++
 +	if (nm_system_dev == 0)
 +		nomount_init_partition_devs();
 +
++	/* Find matching rule under RCU protection */
 +	rcu_read_lock();
 +	hash_for_each_rcu(nomount_rules_ht, bkt, rule, node) {
-+		if (rule->real_ino == inode->i_ino) {
-+			stat->dev = nomount_get_partition_dev(rule->virtual_path);
-+			stat->ino = rule->virtual_ino;
-+			/* Copy timestamps from parent directory for consistency */
-+			nomount_get_parent_timestamps(rule->virtual_path, stat);
-+			rcu_read_unlock();
-+			return;
++		/* Check both inode AND device to avoid cross-filesystem collision */
++		if (rule->real_ino == inode->i_ino &&
++		    rule->real_dev == inode->i_sb->s_dev) {
++			/* Copy data we need before exiting RCU */
++			vpath_copy = kstrdup(rule->virtual_path, GFP_ATOMIC);
++			matched_dev = nomount_get_partition_dev(rule->virtual_path);
++			matched_vino = rule->virtual_ino;
++			found = true;
++			NM_DBG("spoof_stat: matched rule vpath=%s\n", rule->virtual_path);
++			break;
 +		}
 +	}
 +	rcu_read_unlock();
++
++	/* Apply spoofing outside RCU (nomount_get_parent_timestamps can sleep) */
++	if (found) {
++		orig_dev = stat->dev;
++		orig_ino = stat->ino;
++		stat->dev = matched_dev;
++		stat->ino = matched_vino;
++		NM_INFO("spoof_stat: spoofed dev=%u->%u ino=%lu->%lu\n",
++			orig_dev, stat->dev, orig_ino, stat->ino);
++		if (vpath_copy) {
++			nomount_get_parent_timestamps(vpath_copy, stat);
++			kfree(vpath_copy);
++		} else {
++			NM_ERR("spoof_stat: failed to alloc vpath_copy, using static timestamps\n");
++			/* Fallback to static timestamps if alloc failed */
++			stat->atime.tv_sec = STOCK_ANDROID_TIME;
++			stat->mtime.tv_sec = STOCK_ANDROID_TIME;
++			stat->ctime.tv_sec = STOCK_ANDROID_TIME;
++			stat->atime.tv_nsec = 0;
++			stat->mtime.tv_nsec = 0;
++			stat->ctime.tv_nsec = 0;
++		}
++	}
 +}
 +EXPORT_SYMBOL(nomount_spoof_stat);
 +
 +void vfs_dcache_spoof_stat_dev(const char *path, struct kstat *stat)
 +{
 +	dev_t expected_dev;
++	dev_t orig_dev;
++	ino_t orig_ino;
 +
 +	if (!path || !stat || NOMOUNT_DISABLED())
 +		return;
@@ -637,11 +708,17 @@ index 000000000..43ca3f0fa
 +	if (nomount_is_uid_blocked(current_uid().val))
 +		return;
 +
++	NM_DBG("spoof_stat_dev: checking path=%s\n", path);
++
 +	expected_dev = nomount_get_partition_dev_for_path(path);
 +
 +	if (expected_dev != 0 && stat->dev != expected_dev) {
++		orig_dev = stat->dev;
++		orig_ino = stat->ino;
 +		stat->dev = expected_dev;
 +		stat->ino = full_name_hash(NULL, path, strlen(path));
++		NM_INFO("spoof_stat_dev: path=%s dev=%u->%u ino=%lu->%lu\n",
++			path, orig_dev, stat->dev, orig_ino, stat->ino);
 +		/* Copy timestamps from parent directory for consistency */
 +		nomount_get_parent_timestamps(path, stat);
 +	}
@@ -666,7 +743,9 @@ index 000000000..43ca3f0fa
 +
 +	rcu_read_lock();
 +	hash_for_each_rcu(nomount_rules_ht, bkt, rule, node) {
-+		if (rule->real_ino != 0 && rule->real_ino == inode->i_ino) {
++		/* Check both inode AND device to avoid cross-filesystem collision */
++		if (rule->real_ino != 0 && rule->real_ino == inode->i_ino &&
++		    rule->real_dev == inode->i_sb->s_dev) {
 +			/* Derive context from virtual path prefix */
 +			if (strncmp(rule->virtual_path, "/system", 7) == 0)
 +				context = "u:object_r:system_file:s0";
@@ -756,7 +835,9 @@ index 000000000..43ca3f0fa
 +
 +	rcu_read_lock();
 +	hash_for_each_rcu(nomount_rules_ht, bkt, rule, node) {
-+		if (rule->real_ino != 0 && rule->real_ino == inode->i_ino) {
++		/* Check both inode AND device to avoid cross-filesystem collision */
++		if (rule->real_ino != 0 && rule->real_ino == inode->i_ino &&
++		    rule->real_dev == inode->i_sb->s_dev) {
 +			idx = nomount_get_partition_index(rule->virtual_path);
 +			memcpy(buf, &nm_cached_statfs[idx], sizeof(*buf));
 +			rcu_read_unlock();
@@ -764,7 +845,7 @@ index 000000000..43ca3f0fa
 +		}
 +	}
 +	rcu_read_unlock();
-+	return -EINVAL;
++	return -ENODATA;  /* Use ENODATA instead of EINVAL to avoid info leakage */
 +}
 +EXPORT_SYMBOL(nomount_spoof_statfs);
 +
@@ -775,9 +856,12 @@ index 000000000..43ca3f0fa
 +	if (atomic_read(&nomount_enabled) == 0)
 +		return false;
 +
++	NM_DBG("is_mount_hidden: checking mount_id=%d\n", mount_id);
++
 +	rcu_read_lock();
 +	hash_for_each_possible_rcu(nomount_hidden_mounts_ht, entry, node, mount_id) {
 +		if (entry->mount_id == mount_id) {
++			NM_INFO("is_mount_hidden: mount_id=%d is hidden\n", mount_id);
 +			rcu_read_unlock();
 +			return true;
 +		}
@@ -795,6 +879,8 @@ index 000000000..43ca3f0fa
 +	u32 hash;
 +
 +	if (NOMOUNT_DISABLED() || nomount_is_uid_blocked(current_uid().val) || !pathname) return NULL;
++
++	NM_DBG("resolve_path: looking up %s\n", pathname);
 +	hash = full_name_hash(NULL, pathname, strlen(pathname));
 +
 +	rcu_read_lock();
@@ -802,12 +888,20 @@ index 000000000..43ca3f0fa
 +		if (nomount_match_path(pathname, rule->virtual_path)) {
 +			if (rule->flags & NM_FLAG_ACTIVE) {
 +				target = kstrdup(rule->real_path, GFP_ATOMIC);
-+				/* NULL on OOM - caller handles NULL gracefully */
++				if (target) {
++					NM_INFO("resolve_path: %s -> %s\n", pathname, target);
++				} else {
++					NM_ERR("resolve_path: kstrdup failed for %s\n", rule->real_path);
++				}
 +				break;
 +			}
 +		}
 +	}
 +	rcu_read_unlock();
++
++	if (!target) {
++		NM_DBG("resolve_path: no match for %s\n", pathname);
++	}
 +	return target;
 +}
 +EXPORT_SYMBOL(nomount_resolve_path);
@@ -820,13 +914,18 @@ index 000000000..43ca3f0fa
 +	if (NOMOUNT_DISABLED() || nomount_is_uid_blocked(current_uid().val) || !name || name->name[0] != '/')
 +		return name;
 +
++	NM_DBG("getname_hook: checking %s\n", name->name);
++
 +	target_path = nomount_resolve_path(name->name);
 +	if (target_path) {
-+		new_name = getname_kernel(target_path); 
++		NM_INFO("getname_hook: redirecting %s -> %s\n", name->name, target_path);
++		new_name = getname_kernel(target_path);
 +		kfree(target_path);
 +		if (!IS_ERR(new_name)) {
 +			putname(name);
 +			return new_name;
++		} else {
++			NM_ERR("getname_hook: getname_kernel failed (err=%ld)\n", PTR_ERR(new_name));
 +		}
 +	}
 +	return name;
@@ -1075,26 +1174,39 @@ index 000000000..43ca3f0fa
 +	struct path path;
 +	unsigned char type;
 +	u32 hash;
++	int ret;
 +
-+	if (copy_from_user(&data, (void __user *)arg, sizeof(data)))
++	if (copy_from_user(&data, (void __user *)arg, sizeof(data))) {
++		NM_ERR("add_rule: copy_from_user failed\n");
 +		return -EFAULT;
-+	if (!capable(CAP_SYS_ADMIN)) return -EPERM;
++	}
++	if (!capable(CAP_SYS_ADMIN)) {
++		NM_ERR("add_rule: permission denied (uid=%u)\n", current_uid().val);
++		return -EPERM;
++	}
 +
 +	v_path = strndup_user(data.virtual_path, PATH_MAX);
-+	if (IS_ERR(v_path)) return PTR_ERR(v_path);
++	if (IS_ERR(v_path)) {
++		NM_ERR("add_rule: failed to copy virtual_path (err=%ld)\n", PTR_ERR(v_path));
++		return PTR_ERR(v_path);
++	}
 +	r_path = strndup_user(data.real_path, PATH_MAX);
 +	if (IS_ERR(r_path)) {
++		NM_ERR("add_rule: failed to copy real_path (err=%ld)\n", PTR_ERR(r_path));
 +		kfree(v_path);
 +		return PTR_ERR(r_path);
 +	}
 +
++	NM_INFO("add_rule: vpath=%s rpath=%s flags=0x%x\n", v_path, r_path, data.flags);
++
 +	hash = full_name_hash(NULL, v_path, strlen(v_path));
 +	rule = kzalloc(sizeof(*rule), GFP_KERNEL);
 +	if (!rule) {
++		NM_ERR("add_rule: failed to allocate rule struct\n");
 +		kfree(v_path); kfree(r_path);
 +		return -ENOMEM;
 +	}
-+   
++
 +	rule->virtual_path = v_path;
 +	rule->vp_len = strlen(v_path);
 +	rule->real_path = r_path;
@@ -1105,18 +1217,23 @@ index 000000000..43ca3f0fa
 +		nomount_refresh_critical_inodes();
 +	}
 +
-+	if (kern_path(r_path, LOOKUP_FOLLOW, &path) == 0) {
++	ret = kern_path(r_path, LOOKUP_FOLLOW, &path);
++	if (ret == 0) {
 +		if (path.dentry && path.dentry->d_inode) {
 +			rule->real_ino = path.dentry->d_inode->i_ino;
 +			rule->real_dev = path.dentry->d_sb->s_dev;
++			NM_DBG("add_rule: real_ino=%lu real_dev=%u\n",
++			       rule->real_ino, rule->real_dev);
 +		}
 +		path_put(&path);
 +	} else {
++		NM_ERR("add_rule: kern_path failed for %s (err=%d)\n", r_path, ret);
 +		rule->real_ino = 0;
 +		rule->real_dev = 0;
 +	}
 +
 +	rule->virtual_ino = full_name_hash(NULL, v_path, strlen(v_path));
++	NM_DBG("add_rule: virtual_ino=%lu hash=%u\n", rule->virtual_ino, hash);
 +
 +	spin_lock(&nomount_lock);
 +	hash_add_rcu(nomount_rules_ht, &rule->node, hash);
@@ -1126,14 +1243,17 @@ index 000000000..43ca3f0fa
 +	/* Mark parent directory for O(1) hide check optimization */
 +	nomount_mark_parent_has_hidden(v_path);
 +
-+	type = DT_REG; 
++	type = DT_REG;
 +	if (data.flags & NM_FLAG_IS_DIR) type = DT_DIR;
 +
 +	if (kern_path(rule->virtual_path, LOOKUP_FOLLOW, &path) != 0) {
++		NM_DBG("add_rule: vpath doesn't exist, injecting into parent\n");
 +		nomount_auto_inject_parent_recursive(rule->virtual_path, type);
 +		rule->is_new = true;
 +	}
 +	nomount_flush_dcache(rule->virtual_path);
++
++	NM_INFO("add_rule: success vpath=%s -> rpath=%s\n", v_path, r_path);
 +	return 0;
 +}
 +
@@ -1146,25 +1266,36 @@ index 000000000..43ca3f0fa
 +	int bkt;
 +	bool found = false;
 +
-+	if (copy_from_user(&data, (void __user *)arg, sizeof(data)))
++	if (copy_from_user(&data, (void __user *)arg, sizeof(data))) {
++		NM_ERR("del_rule: copy_from_user failed\n");
 +		return -EFAULT;
++	}
 +
 +	v_path = strndup_user(data.virtual_path, PATH_MAX);
-+	if (IS_ERR(v_path)) return PTR_ERR(v_path);
++	if (IS_ERR(v_path)) {
++		NM_ERR("del_rule: failed to copy virtual_path (err=%ld)\n", PTR_ERR(v_path));
++		return PTR_ERR(v_path);
++	}
++
++	NM_INFO("del_rule: vpath=%s\n", v_path);
 +
 +	spin_lock(&nomount_lock);
 +	hash_for_each_safe(nomount_rules_ht, bkt, tmp, rule, node) {
 +		if (strcmp(rule->virtual_path, v_path) == 0) {
++			NM_DBG("del_rule: found rule at bucket %d\n", bkt);
 +			hash_del_rcu(&rule->node);
 +			list_del(&rule->list);
 +			found = true;
-+			break; 
++			break;
 +		}
 +	}
 +	spin_unlock(&nomount_lock);
 +
 +	if (found && rule) {
++		NM_INFO("del_rule: removed vpath=%s\n", v_path);
 +		call_rcu(&rule->rcu, nomount_free_rule_rcu);
++	} else {
++		NM_ERR("del_rule: rule not found for vpath=%s\n", v_path);
 +	}
 +
 +	kfree(v_path);
@@ -1179,28 +1310,37 @@ index 000000000..43ca3f0fa
 +	struct nomount_child_name *child, *tmp_child;
 +	struct hlist_node *tmp;
 +	int bkt;
++	int rule_count = 0, uid_count = 0, dir_count = 0;
++
++	NM_INFO("clear_rules: clearing all rules\n");
 +
 +	spin_lock(&nomount_lock);
 +
 +	hash_for_each_safe(nomount_rules_ht, bkt, tmp, rule, node) {
++		NM_DBG("clear_rules: removing rule vpath=%s\n", rule->virtual_path);
 +		hash_del_rcu(&rule->node);
 +		list_del(&rule->list);
 +		call_rcu(&rule->rcu, nomount_free_rule_rcu);
++		rule_count++;
 +	}
 +
 +	hash_for_each_safe(nomount_uid_ht, bkt, tmp, uid_node, node) {
++		NM_DBG("clear_rules: removing uid=%u\n", uid_node->uid);
 +		hash_del_rcu(&uid_node->node);
 +		kfree_rcu(uid_node, rcu);
++		uid_count++;
 +	}
 +
 +	/* Clear directory injection cache with proper RCU callbacks */
 +	hash_for_each_safe(nomount_dirs_ht, bkt, tmp, dir_node, node) {
++		NM_DBG("clear_rules: removing dir=%s\n", dir_node->dir_path);
 +		list_for_each_entry_safe(child, tmp_child, &dir_node->children_names, list) {
 +			list_del_rcu(&child->list);
 +			call_rcu(&child->rcu, nomount_free_child_rcu);
 +		}
 +		hash_del_rcu(&dir_node->node);
 +		call_rcu(&dir_node->rcu, nomount_free_dir_rcu);
++		dir_count++;
 +	}
 +
 +	/* CRITICAL: Reset inode cache to fix tainted state */
@@ -1208,6 +1348,9 @@ index 000000000..43ca3f0fa
 +	nm_ino_modules = 0;
 +
 +	spin_unlock(&nomount_lock);
++
++	NM_INFO("clear_rules: cleared %d rules, %d uids, %d dirs\n",
++		rule_count, uid_count, dir_count);
 +	return 0;
 +}
 +
@@ -1252,20 +1395,31 @@ index 000000000..43ca3f0fa
 +	unsigned int uid;
 +	struct nomount_uid_node *entry;
 +
-+	if (copy_from_user(&uid, (void __user *)arg, sizeof(uid)))
++	if (copy_from_user(&uid, (void __user *)arg, sizeof(uid))) {
++		NM_ERR("add_uid: copy_from_user failed\n");
 +		return -EFAULT;
-+	
-+	if (nomount_is_uid_blocked(uid)) return -EEXIST;
++	}
++
++	NM_INFO("add_uid: adding uid=%u\n", uid);
++
++	if (nomount_is_uid_blocked(uid)) {
++		NM_ERR("add_uid: uid=%u already exists\n", uid);
++		return -EEXIST;
++	}
 +
 +	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
-+	if (!entry) return -ENOMEM;
++	if (!entry) {
++		NM_ERR("add_uid: failed to allocate entry for uid=%u\n", uid);
++		return -ENOMEM;
++	}
 +
 +	entry->uid = uid;
-+	
++
 +	spin_lock(&nomount_lock);
 +	hash_add_rcu(nomount_uid_ht, &entry->node, uid);
 +	spin_unlock(&nomount_lock);
-+	
++
++	NM_INFO("add_uid: success uid=%u\n", uid);
 +	return 0;
 +}
 +
@@ -1277,21 +1431,28 @@ index 000000000..43ca3f0fa
 +	int bkt;
 +	bool found = false;
 +
-+	if (copy_from_user(&uid, (void __user *)arg, sizeof(uid)))
++	if (copy_from_user(&uid, (void __user *)arg, sizeof(uid))) {
++		NM_ERR("del_uid: copy_from_user failed\n");
 +		return -EFAULT;
++	}
++
++	NM_INFO("del_uid: removing uid=%u\n", uid);
 +
 +	spin_lock(&nomount_lock);
 +	hash_for_each_safe(nomount_uid_ht, bkt, tmp, entry, node) {
 +		if (entry->uid == uid) {
 +			hash_del_rcu(&entry->node);
 +			found = true;
-+			break; 
++			break;
 +		}
 +	}
 +	spin_unlock(&nomount_lock);
 +
 +	if (found && entry) {
++		NM_INFO("del_uid: removed uid=%u\n", uid);
 +		kfree_rcu(entry, rcu);
++	} else {
++		NM_ERR("del_uid: uid=%u not found\n", uid);
 +	}
 +
 +	return found ? 0 : -ENOENT;
@@ -1302,18 +1463,28 @@ index 000000000..43ca3f0fa
 +	int mount_id;
 +	struct nomount_hidden_mount *entry;
 +
-+	if (copy_from_user(&mount_id, (void __user *)arg, sizeof(mount_id)))
++	if (copy_from_user(&mount_id, (void __user *)arg, sizeof(mount_id))) {
++		NM_ERR("hide_mount: copy_from_user failed\n");
 +		return -EFAULT;
++	}
 +
-+	if (mount_id <= 0)
++	NM_INFO("hide_mount: hiding mount_id=%d\n", mount_id);
++
++	if (mount_id <= 0) {
++		NM_ERR("hide_mount: invalid mount_id=%d\n", mount_id);
 +		return -EINVAL;
++	}
 +
-+	if (vfs_dcache_is_mount_hidden(mount_id))
++	if (vfs_dcache_is_mount_hidden(mount_id)) {
++		NM_ERR("hide_mount: mount_id=%d already hidden\n", mount_id);
 +		return -EEXIST;
++	}
 +
 +	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
-+	if (!entry)
++	if (!entry) {
++		NM_ERR("hide_mount: failed to allocate entry for mount_id=%d\n", mount_id);
 +		return -ENOMEM;
++	}
 +
 +	entry->mount_id = mount_id;
 +	entry->flags = 0;
@@ -1322,6 +1493,7 @@ index 000000000..43ca3f0fa
 +	hash_add_rcu(nomount_hidden_mounts_ht, &entry->node, mount_id);
 +	spin_unlock(&nomount_lock);
 +
++	NM_INFO("hide_mount: success mount_id=%d\n", mount_id);
 +	return 0;
 +}
 +
@@ -1332,8 +1504,12 @@ index 000000000..43ca3f0fa
 +	struct hlist_node *tmp;
 +	bool found = false;
 +
-+	if (copy_from_user(&mount_id, (void __user *)arg, sizeof(mount_id)))
++	if (copy_from_user(&mount_id, (void __user *)arg, sizeof(mount_id))) {
++		NM_ERR("unhide_mount: copy_from_user failed\n");
 +		return -EFAULT;
++	}
++
++	NM_INFO("unhide_mount: unhiding mount_id=%d\n", mount_id);
 +
 +	spin_lock(&nomount_lock);
 +	hash_for_each_possible_safe(nomount_hidden_mounts_ht, entry, tmp, node, mount_id) {
@@ -1345,8 +1521,12 @@ index 000000000..43ca3f0fa
 +	}
 +	spin_unlock(&nomount_lock);
 +
-+	if (found && entry)
++	if (found && entry) {
++		NM_INFO("unhide_mount: success mount_id=%d\n", mount_id);
 +		kfree_rcu(entry, rcu);
++	} else {
++		NM_ERR("unhide_mount: mount_id=%d not found\n", mount_id);
++	}
 +
 +	return found ? 0 : -ENOENT;
 +}
@@ -1356,14 +1536,20 @@ index 000000000..43ca3f0fa
 +	struct nomount_hidden_mount *entry;
 +	struct hlist_node *tmp;
 +	int bkt;
++	int count = 0;
++
++	NM_INFO("clear_hidden_mounts: clearing all hidden mounts\n");
 +
 +	spin_lock(&nomount_lock);
 +	hash_for_each_safe(nomount_hidden_mounts_ht, bkt, tmp, entry, node) {
++		NM_DBG("clear_hidden_mounts: removing mount_id=%d\n", entry->mount_id);
 +		hash_del_rcu(&entry->node);
 +		kfree_rcu(entry, rcu);
++		count++;
 +	}
 +	spin_unlock(&nomount_lock);
 +
++	NM_INFO("clear_hidden_mounts: cleared %d mounts\n", count);
 +	return 0;
 +}
 +
@@ -1371,13 +1557,22 @@ index 000000000..43ca3f0fa
 +{
 +	struct nm_partition_dev pd;
 +
-+	if (copy_from_user(&pd, (void __user *)arg, sizeof(pd)))
++	if (copy_from_user(&pd, (void __user *)arg, sizeof(pd))) {
++		NM_ERR("set_partition_dev: copy_from_user failed\n");
 +		return -EFAULT;
++	}
 +
-+	if (pd.partition_id < 0 || pd.partition_id >= NM_PART_COUNT)
++	NM_INFO("set_partition_dev: part=%d major=%u minor=%u\n",
++		pd.partition_id, pd.dev_major, pd.dev_minor);
++
++	if (pd.partition_id < 0 || pd.partition_id >= NM_PART_COUNT) {
++		NM_ERR("set_partition_dev: invalid partition_id=%d\n", pd.partition_id);
 +		return -EINVAL;
++	}
 +
 +	nm_partition_devs[pd.partition_id] = MKDEV(pd.dev_major, pd.dev_minor);
++	NM_INFO("set_partition_dev: success part=%d dev=%u:%u\n",
++		pd.partition_id, pd.dev_major, pd.dev_minor);
 +	return 0;
 +}
 +
@@ -1388,11 +1583,16 @@ index 000000000..43ca3f0fa
 +	u32 hash;
 +
 +	pattern = strndup_user((char __user *)arg, PATH_MAX);
-+	if (IS_ERR(pattern))
++	if (IS_ERR(pattern)) {
++		NM_ERR("add_maps_pattern: strndup_user failed (err=%ld)\n", PTR_ERR(pattern));
 +		return PTR_ERR(pattern);
++	}
++
++	NM_INFO("add_maps_pattern: adding pattern=%s\n", pattern);
 +
 +	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
 +	if (!entry) {
++		NM_ERR("add_maps_pattern: failed to allocate entry for pattern=%s\n", pattern);
 +		kfree(pattern);
 +		return -ENOMEM;
 +	}
@@ -1405,7 +1605,17 @@ index 000000000..43ca3f0fa
 +	hash_add_rcu(nomount_maps_patterns_ht, &entry->node, hash);
 +	spin_unlock(&nomount_lock);
 +
++	NM_INFO("add_maps_pattern: success pattern=%s\n", pattern);
 +	return 0;
++}
++
++/* RCU callback to safely free maps pattern entry and its string */
++static void nomount_maps_pattern_free_rcu(struct rcu_head *head)
++{
++	struct nomount_maps_pattern *entry =
++		container_of(head, struct nomount_maps_pattern, rcu);
++	kfree(entry->pattern);
++	kfree(entry);
 +}
 +
 +static int nomount_ioctl_clear_maps_patterns(void)
@@ -1413,15 +1623,21 @@ index 000000000..43ca3f0fa
 +	struct nomount_maps_pattern *entry;
 +	struct hlist_node *tmp;
 +	int bkt;
++	int count = 0;
++
++	NM_INFO("clear_maps_patterns: clearing all maps patterns\n");
 +
 +	spin_lock(&nomount_lock);
 +	hash_for_each_safe(nomount_maps_patterns_ht, bkt, tmp, entry, node) {
++		NM_DBG("clear_maps_patterns: removing pattern=%s\n", entry->pattern);
 +		hash_del_rcu(&entry->node);
-+		kfree(entry->pattern);
-+		kfree_rcu(entry, rcu);
++		/* Use custom callback to free pattern string after grace period */
++		call_rcu(&entry->rcu, nomount_maps_pattern_free_rcu);
++		count++;
 +	}
 +	spin_unlock(&nomount_lock);
 +
++	NM_INFO("clear_maps_patterns: cleared %d patterns\n", count);
 +	return 0;
 +}
 +
@@ -1434,30 +1650,95 @@ index 000000000..43ca3f0fa
 +	 * the file exists.
 +	 */
 +	if (!nomount_is_root_caller()) {
++		NM_ERR("dev_open: permission denied for uid=%u pid=%d\n",
++		       current_uid().val, current->pid);
 +		return -EPERM;
 +	}
++	NM_DBG("dev_open: opened by uid=%u pid=%d\n", current_uid().val, current->pid);
 +	return 0;
 +}
 +
 +static long nomount_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 +{
-+	if (_IOC_TYPE(cmd) != NOMOUNT_MAGIC_CODE)
++	long ret;
++
++	NM_DBG("ioctl: cmd=0x%x arg=0x%lx pid=%d\n", cmd, arg, current->pid);
++
++	if (_IOC_TYPE(cmd) != NOMOUNT_MAGIC_CODE) {
++		NM_ERR("ioctl: invalid magic (got 0x%x, expected 0x%x)\n",
++		       _IOC_TYPE(cmd), NOMOUNT_MAGIC_CODE);
 +		return -ENOTTY;
++	}
++
++	/* All IOCTLs except GET_VERSION require CAP_SYS_ADMIN */
++	/* This prevents privilege escalation via fd passing (SCM_RIGHTS) */
++	if (cmd != NOMOUNT_IOC_GET_VERSION && !capable(CAP_SYS_ADMIN)) {
++		NM_ERR("ioctl: permission denied for cmd=0x%x (uid=%u)\n",
++		       cmd, current_uid().val);
++		return -EPERM;
++	}
++
 +	switch (cmd) {
-+	case NOMOUNT_IOC_GET_VERSION: return NOMOUNT_VERSION;
-+	case NOMOUNT_IOC_ADD_RULE: return nomount_ioctl_add_rule(arg);
-+	case NOMOUNT_IOC_DEL_RULE: return nomount_ioctl_del_rule(arg);
-+	case NOMOUNT_IOC_CLEAR_ALL: return nomount_ioctl_clear_rules();
-+	case NOMOUNT_IOC_ADD_UID: return nomount_ioctl_add_uid(arg);
-+	case NOMOUNT_IOC_DEL_UID: return nomount_ioctl_del_uid(arg);
-+	case NOMOUNT_IOC_GET_LIST: return nomount_ioctl_list_rules(arg);
-+	case NOMOUNT_IOC_HIDE_MOUNT: return nomount_ioctl_hide_mount(arg);
-+	case NOMOUNT_IOC_UNHIDE_MOUNT: return nomount_ioctl_unhide_mount(arg);
-+	case NOMOUNT_IOC_CLEAR_HIDDEN_MOUNTS: return nomount_ioctl_clear_hidden_mounts();
-+	case NOMOUNT_IOC_SET_PARTITION_DEV: return nomount_ioctl_set_partition_dev(arg);
-+	case NOMOUNT_IOC_ADD_MAPS_PATTERN: return nomount_ioctl_add_maps_pattern(arg);
-+	case NOMOUNT_IOC_CLEAR_MAPS_PATTERNS: return nomount_ioctl_clear_maps_patterns();
-+	default: return -EINVAL;
++	case NOMOUNT_IOC_GET_VERSION:
++		NM_DBG("ioctl: GET_VERSION\n");
++		return NOMOUNT_VERSION;
++	case NOMOUNT_IOC_ADD_RULE:
++		NM_INFO("ioctl: ADD_RULE\n");
++		ret = nomount_ioctl_add_rule(arg);
++		NM_DBG("ioctl: ADD_RULE returned %ld\n", ret);
++		return ret;
++	case NOMOUNT_IOC_DEL_RULE:
++		NM_INFO("ioctl: DEL_RULE\n");
++		ret = nomount_ioctl_del_rule(arg);
++		NM_DBG("ioctl: DEL_RULE returned %ld\n", ret);
++		return ret;
++	case NOMOUNT_IOC_CLEAR_ALL:
++		NM_INFO("ioctl: CLEAR_ALL\n");
++		ret = nomount_ioctl_clear_rules();
++		NM_INFO("ioctl: CLEAR_ALL completed\n");
++		return ret;
++	case NOMOUNT_IOC_ADD_UID:
++		NM_INFO("ioctl: ADD_UID\n");
++		ret = nomount_ioctl_add_uid(arg);
++		NM_DBG("ioctl: ADD_UID returned %ld\n", ret);
++		return ret;
++	case NOMOUNT_IOC_DEL_UID:
++		NM_INFO("ioctl: DEL_UID\n");
++		ret = nomount_ioctl_del_uid(arg);
++		NM_DBG("ioctl: DEL_UID returned %ld\n", ret);
++		return ret;
++	case NOMOUNT_IOC_GET_LIST:
++		NM_DBG("ioctl: GET_LIST\n");
++		return nomount_ioctl_list_rules(arg);
++	case NOMOUNT_IOC_HIDE_MOUNT:
++		NM_INFO("ioctl: HIDE_MOUNT\n");
++		ret = nomount_ioctl_hide_mount(arg);
++		NM_DBG("ioctl: HIDE_MOUNT returned %ld\n", ret);
++		return ret;
++	case NOMOUNT_IOC_UNHIDE_MOUNT:
++		NM_INFO("ioctl: UNHIDE_MOUNT\n");
++		ret = nomount_ioctl_unhide_mount(arg);
++		NM_DBG("ioctl: UNHIDE_MOUNT returned %ld\n", ret);
++		return ret;
++	case NOMOUNT_IOC_CLEAR_HIDDEN_MOUNTS:
++		NM_INFO("ioctl: CLEAR_HIDDEN_MOUNTS\n");
++		return nomount_ioctl_clear_hidden_mounts();
++	case NOMOUNT_IOC_SET_PARTITION_DEV:
++		NM_INFO("ioctl: SET_PARTITION_DEV\n");
++		ret = nomount_ioctl_set_partition_dev(arg);
++		NM_DBG("ioctl: SET_PARTITION_DEV returned %ld\n", ret);
++		return ret;
++	case NOMOUNT_IOC_ADD_MAPS_PATTERN:
++		NM_INFO("ioctl: ADD_MAPS_PATTERN\n");
++		ret = nomount_ioctl_add_maps_pattern(arg);
++		NM_DBG("ioctl: ADD_MAPS_PATTERN returned %ld\n", ret);
++		return ret;
++	case NOMOUNT_IOC_CLEAR_MAPS_PATTERNS:
++		NM_INFO("ioctl: CLEAR_MAPS_PATTERNS\n");
++		return nomount_ioctl_clear_maps_patterns();
++	default:
++		NM_ERR("ioctl: unknown command 0x%x\n", cmd);
++		return -EINVAL;
 +	}
 +}
 +
@@ -1478,8 +1759,11 @@ index 000000000..43ca3f0fa
 +	int ret;
 +	spin_lock_init(&nomount_lock);
 +	ret = misc_register(&nomount_device);
-+	if (ret) return ret;
-+	/* No log message to avoid detection */
++	if (ret) {
++		NM_ERR("init: misc_register failed (err=%d)\n", ret);
++		return ret;
++	}
++	NM_INFO("init: vfs_dcache subsystem initialized (debug=%d)\n", nomount_debug);
 +	return 0;
 +}
 +fs_initcall(nomount_init);

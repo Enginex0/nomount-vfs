@@ -1,11 +1,40 @@
-#!/bin/sh
+#!/system/bin/sh
 # NoMount Universal Hijacker - service.sh
 # LATE BOOT PHASE: VFS registration (KPM should be loaded by now)
 # Non-blocking check - if /dev/vfs_helper unavailable, skip gracefully
+# NOTE: Uses /system/bin/sh for `local` keyword support (mksh on Android)
 
 MODDIR=${0%/*}
-LOADER="$MODDIR/bin/nm"
+[ "$MODDIR" = "$0" ] && MODDIR="."  # Fallback if invoked without path
 MODULES_DIR="/data/adb/modules"
+
+# ============================================================
+# FUNCTION: Find nm binary dynamically
+# Checks multiple possible locations for flexibility
+# ============================================================
+find_nm_binary() {
+    local possible_paths="
+        $MODDIR/bin/nm
+        $MODDIR/nm-arm64
+        $MODDIR/nm
+        /data/adb/modules/nomount/bin/nm
+        /data/adb/modules/nomount/nm-arm64
+        /data/adb/modules/nomount/nm
+    "
+    for path in $possible_paths; do
+        if [ -x "$path" ]; then
+            echo "$path"
+            return 0
+        fi
+    done
+    return 1
+}
+
+LOADER=$(find_nm_binary)
+if [ -z "$LOADER" ]; then
+    echo "[$(date '+%H:%M:%S')] [ERROR] nm binary not found!" >> "/data/adb/nomount/nomount.log"
+    exit 1
+fi
 NOMOUNT_DATA="/data/adb/nomount"
 LOG_FILE="$NOMOUNT_DATA/nomount.log"
 CONFIG_FILE="$NOMOUNT_DATA/config.sh"
@@ -16,17 +45,77 @@ TARGET_PARTITIONS="system vendor product system_ext odm oem mi_ext my_heytap pri
 # Counters
 ACTIVE_MODULES_COUNT=0
 HIJACKED_OVERLAYS_COUNT=0
+FAILED_COUNT=0
+VFS_REGISTERED_COUNT=0
+START_TIME=$(date +%s)
+
+# Ensure data directory exists before any writes
+mkdir -p "$NOMOUNT_DATA" 2>/dev/null
+chmod 755 "$NOMOUNT_DATA" 2>/dev/null
+
+# ============================================================
+# External Sync Trigger API Directory
+# ============================================================
+# Create sync_trigger directory for external module integration.
+# External modules can trigger a sync by creating a marker file:
+#   touch /data/adb/nomount/sync_trigger/<module_name>
+# The monitor will call sync.sh for that specific module.
+# ============================================================
+SYNC_TRIGGER_DIR="$NOMOUNT_DATA/sync_trigger"
+mkdir -p "$SYNC_TRIGGER_DIR" 2>/dev/null
+
+# ============================================================
+# LOGGING FUNCTIONS - Comprehensive error tracking
+# ============================================================
+LOG_LEVEL="${LOG_LEVEL:-2}"  # 0=off, 1=error, 2=info, 3=debug
+
+log_err() {
+    [ "$LOG_LEVEL" -ge 1 ] && echo "[$(date '+%H:%M:%S')] [ERROR] $*" >> "$LOG_FILE"
+    FAILED_COUNT=$((FAILED_COUNT + 1))
+}
+
+log_info() {
+    [ "$LOG_LEVEL" -ge 2 ] && echo "[$(date '+%H:%M:%S')] [INFO] $*" >> "$LOG_FILE"
+}
+
+log_debug() {
+    [ "$LOG_LEVEL" -ge 3 ] && echo "[$(date '+%H:%M:%S')] [DEBUG] $*" >> "$LOG_FILE"
+}
+
+log_cmd() {
+    # Log command execution with return code
+    local cmd="$1"
+    local result
+    result=$(eval "$cmd" 2>&1)
+    local rc=$?
+    if [ $rc -eq 0 ]; then
+        log_debug "CMD OK: $cmd"
+    else
+        log_err "CMD FAIL (rc=$rc): $cmd -> $result"
+    fi
+    echo "$result"
+    return $rc
+}
+
+# Trap errors and log them (compatible with mksh)
+trap 'log_err "Unexpected error at line $LINENO"' ERR 2>/dev/null || true
 
 # Append to existing log
 echo "" >> "$LOG_FILE"
 echo "========== SERVICE.SH PHASE (Late Boot) ==========" >> "$LOG_FILE"
 echo "Time: $(date)" >> "$LOG_FILE"
+log_info "Script version: 2.0-enhanced-logging"
+log_info "MODDIR=$MODDIR"
+log_info "LOADER=$LOADER"
+log_info "MODULES_DIR=$MODULES_DIR"
+log_info "NOMOUNT_DATA=$NOMOUNT_DATA"
+log_info "LOG_LEVEL=$LOG_LEVEL"
 echo "" >> "$LOG_FILE"
 
 # Initialize skip_mount tracking (fresh on each boot)
 : > "$NOMOUNT_DATA/skipped_modules"
 
-# Load config
+# Load config with security checks
 universal_hijack=true
 aggressive_mode=false
 monitor_new_modules=true
@@ -34,58 +123,87 @@ excluded_modules=""
 skip_hosts_modules=true
 skip_nomount_marker=true
 
-[ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
+# Only source config if owned by root and not world-writable
+if [ -f "$CONFIG_FILE" ]; then
+    config_owner=$(stat -c '%u' "$CONFIG_FILE" 2>/dev/null)
+    config_perms=$(stat -c '%a' "$CONFIG_FILE" 2>/dev/null)
+    if [ "$config_owner" = "0" ] && [ "${config_perms#*2}" = "$config_perms" ]; then
+        . "$CONFIG_FILE"
+    else
+        echo "[WARN] Config file has unsafe permissions, using defaults" >> "$LOG_FILE"
+    fi
+fi
 
 # Verbose mode
 VERBOSE=false
 [ -f "$VERBOSE_FLAG" ] && VERBOSE=true
 
 # ============================================================
-# FUNCTION: Logging helper
+# FUNCTION: Legacy logging helper (compatibility wrapper)
 # ============================================================
 log() {
-    echo "$1" >> "$LOG_FILE"
+    log_info "$1"
 }
 
 # ============================================================
 # FUNCTION: Detect root framework
 # ============================================================
 detect_framework() {
+    log_debug ">>> ENTER: detect_framework"
+    local result="unknown"
     if [ -d "/data/adb/ksu" ] && [ -f "/data/adb/ksu/modules.img" ]; then
-        echo "kernelsu"
+        result="kernelsu"
+        log_debug "Found KernelSU: /data/adb/ksu exists with modules.img"
     elif [ -d "/data/adb/ap" ]; then
-        echo "apatch"
+        result="apatch"
+        log_debug "Found APatch: /data/adb/ap exists"
     elif [ -d "/data/adb/magisk" ]; then
-        echo "magisk"
+        result="magisk"
+        log_debug "Found Magisk: /data/adb/magisk exists"
     else
-        echo "unknown"
+        log_debug "No known root framework detected"
     fi
+    log_debug "<<< EXIT: detect_framework (result=$result)"
+    echo "$result"
 }
 
 FRAMEWORK=$(detect_framework)
-echo "[INFO] Detected framework: $FRAMEWORK" >> "$LOG_FILE"
+log_info "Detected framework: $FRAMEWORK"
 
 # APatch-specific handling
 if [ "$FRAMEWORK" = "apatch" ]; then
     # APatch uses slightly different paths in some versions
-    [ -d "/data/adb/ap/modules" ] && MODULES_DIR="/data/adb/ap/modules"
-    echo "[INFO] APatch mode - using modules dir: $MODULES_DIR" >> "$LOG_FILE"
+    if [ -d "/data/adb/ap/modules" ]; then
+        MODULES_DIR="/data/adb/ap/modules"
+        log_info "APatch mode - using modules dir: $MODULES_DIR"
+    else
+        log_debug "APatch detected but /data/adb/ap/modules not found, using default"
+    fi
 fi
 
 # ============================================================
 # NON-BLOCKING CHECK: Is /dev/vfs_helper available?
 # ============================================================
+log_info "Checking VFS driver availability..."
 if [ ! -c "/dev/vfs_helper" ]; then
-    echo "[INFO] /dev/vfs_helper not available - VFS registration skipped" >> "$LOG_FILE"
-    echo "[INFO] Module will work normally on next boot when KPM is loaded" >> "$LOG_FILE"
-    echo "[INFO] Continuing without VFS..." >> "$LOG_FILE"
+    log_info "/dev/vfs_helper not available - VFS registration skipped"
+    log_info "Module will work normally on next boot when KPM is loaded"
+    log_info "Continuing without VFS..."
+    log_debug "Starting monitor.sh with args: 0 0"
 
     # Still start monitor for module description updates
     sh "$MODDIR/monitor.sh" "0" "0" &
+    log_info "Monitor started (PID: $!)"
+
+    END_TIME=$(date +%s)
+    log_info "========== EXECUTION SUMMARY (NO VFS) =========="
+    log_info "Execution time: $((END_TIME - START_TIME))s"
+    log_info "VFS driver: NOT AVAILABLE"
     exit 0
 fi
 
-echo "[OK] /dev/vfs_helper ready - proceeding with VFS registration" >> "$LOG_FILE"
+log_info "VFS driver check: /dev/vfs_helper is a character device - READY"
+log_debug "VFS device permissions: $(ls -la /dev/vfs_helper 2>/dev/null || echo 'unable to stat')"
 
 # ============================================================
 # HIDE /dev/vfs_helper FROM NON-ROOT DETECTION APPS
@@ -93,17 +211,31 @@ echo "[OK] /dev/vfs_helper ready - proceeding with VFS registration" >> "$LOG_FI
 # Kernel-level hiding returns ENOENT for non-root open() calls
 # SUSFS sus_path provides additional protection (hides from readdir too)
 # We must hide: /dev/vfs_helper, /sys/class/misc/vfs_helper, /sys/devices/virtual/misc/vfs_helper
+log_info "Hiding VFS device from detection apps..."
 if command -v ksu_susfs >/dev/null 2>&1; then
+    log_debug "SUSFS available, hiding device paths"
     # Hide device node
-    ksu_susfs add_sus_path /dev/vfs_helper 2>/dev/null
+    if ksu_susfs add_sus_path /dev/vfs_helper 2>/dev/null; then
+        log_debug "Hidden: /dev/vfs_helper"
+    else
+        log_err "Failed to hide /dev/vfs_helper via SUSFS"
+    fi
     # Hide sysfs class entry (detectable via stat/readdir)
-    ksu_susfs add_sus_path /sys/class/misc/vfs_helper 2>/dev/null
+    if ksu_susfs add_sus_path /sys/class/misc/vfs_helper 2>/dev/null; then
+        log_debug "Hidden: /sys/class/misc/vfs_helper"
+    else
+        log_debug "Could not hide /sys/class/misc/vfs_helper (may not exist)"
+    fi
     # Hide sysfs device entry
-    ksu_susfs add_sus_path /sys/devices/virtual/misc/vfs_helper 2>/dev/null
-    echo "[HIDE] /dev/vfs_helper hidden via SUSFS (dev + sysfs)" >> "$LOG_FILE"
+    if ksu_susfs add_sus_path /sys/devices/virtual/misc/vfs_helper 2>/dev/null; then
+        log_debug "Hidden: /sys/devices/virtual/misc/vfs_helper"
+    else
+        log_debug "Could not hide /sys/devices/virtual/misc/vfs_helper (may not exist)"
+    fi
+    log_info "VFS device hidden via SUSFS (dev + sysfs)"
 else
-    echo "[HIDE] /dev/vfs_helper protected by kernel-level hiding (SUSFS not available)" >> "$LOG_FILE"
-    echo "[WARN] /sys/class/misc/vfs_helper may still be visible without SUSFS" >> "$LOG_FILE"
+    log_info "SUSFS not available - relying on kernel-level hiding only"
+    log_debug "/sys/class/misc/vfs_helper may still be visible to detection apps"
 fi
 
 echo "" >> "$LOG_FILE"
@@ -112,9 +244,12 @@ echo "" >> "$LOG_FILE"
 # FUNCTION: Check if module is excluded (by name)
 # ============================================================
 is_excluded() {
-    mod_name="$1"
+    local mod_name="$1"
     # Use -w for portable word matching instead of \b
-    echo "$excluded_modules" | grep -qw "$mod_name" && return 0
+    if echo "$excluded_modules" | grep -qw "$mod_name"; then
+        log_debug "Module '$mod_name' is in exclusion list"
+        return 0
+    fi
     return 1
 }
 
@@ -126,9 +261,12 @@ should_skip_module() {
     local mod_path="$1"
     local mod_name="$2"
 
+    log_debug ">>> ENTER: should_skip_module($mod_name)"
+
     # Check for skip_nomount marker
     if [ "$skip_nomount_marker" = "true" ] && [ -f "$mod_path/skip_nomount" ]; then
-        echo "  [SKIP] $mod_name has skip_nomount marker" >> "$LOG_FILE"
+        log_info "SKIP: $mod_name has skip_nomount marker"
+        log_debug "<<< EXIT: should_skip_module (skip=true, reason=marker)"
         return 0
     fi
 
@@ -136,12 +274,14 @@ should_skip_module() {
     if [ "$skip_hosts_modules" = "true" ]; then
         for partition in $TARGET_PARTITIONS; do
             if [ -f "$mod_path/$partition/etc/hosts" ]; then
-                echo "  [SKIP] $mod_name modifies /etc/hosts (detection risk)" >> "$LOG_FILE"
+                log_info "SKIP: $mod_name modifies /etc/hosts (detection risk)"
+                log_debug "<<< EXIT: should_skip_module (skip=true, reason=hosts)"
                 return 0
             fi
         done
     fi
 
+    log_debug "<<< EXIT: should_skip_module (skip=false)"
     return 1
 }
 
@@ -150,33 +290,47 @@ should_skip_module() {
 # Detects: overlay mounts, bind mounts, loop mounts, tmpfs
 # ============================================================
 detect_all_module_mounts() {
-    echo "[HIJACK] Scanning for ALL module-related mounts..." >> "$LOG_FILE"
+    log_debug ">>> ENTER: detect_all_module_mounts"
+    log_info "Scanning for ALL module-related mounts..."
+
+    # CRITICAL: Read /proc/mounts ONCE to avoid race conditions
+    # Mount state can change between reads, causing inconsistent detection
+    local mounts_snapshot
+    mounts_snapshot=$(cat /proc/mounts)
+    local mount_line_count=$(echo "$mounts_snapshot" | wc -l)
+    log_debug "Read $mount_line_count lines from /proc/mounts"
+
+    local overlay_count=0 bind_count=0 loop_count=0 tmpfs_count=0
 
     # 1. Overlay mounts on target partitions
-    while read -r device mountpoint fstype options rest; do
+    log_debug "Phase 1: Scanning overlay mounts..."
+    echo "$mounts_snapshot" | while read -r device mountpoint fstype options rest; do
         if [ "$fstype" = "overlay" ]; then
             for partition in $TARGET_PARTITIONS; do
                 if echo "$mountpoint" | grep -q "^/$partition"; then
                     echo "overlay:$mountpoint"
-                    echo "[HIJACK] Found overlay: $mountpoint" >> "$LOG_FILE"
+                    log_info "Found overlay: $mountpoint"
+                    log_debug "  device=$device fstype=$fstype"
                 fi
             done
         fi
-    done < /proc/mounts
+    done
 
     # 2. Bind mounts (source contains /data/adb/modules)
-    while read -r device mountpoint fstype options rest; do
+    log_debug "Phase 2: Scanning bind mounts..."
+    echo "$mounts_snapshot" | while read -r device mountpoint fstype options rest; do
         if echo "$options" | grep -q "bind"; then
             if echo "$device" | grep -q "/data/adb/modules"; then
                 echo "bind:$mountpoint"
-                echo "[HIJACK] Found bind mount: $mountpoint (source: $device)" >> "$LOG_FILE"
+                log_info "Found bind mount: $mountpoint (source: $device)"
             fi
         fi
-    done < /proc/mounts
+    done
 
     # 3. Check for bind mounts via same device/inode on target partitions
     # These may not have explicit bind option
-    while read -r device mountpoint fstype options rest; do
+    log_debug "Phase 3: Scanning hidden bind mounts..."
+    echo "$mounts_snapshot" | while read -r device mountpoint fstype options rest; do
         for partition in $TARGET_PARTITIONS; do
             if echo "$mountpoint" | grep -q "^/$partition" && [ "$fstype" != "overlay" ]; then
                 # Check if this is a hidden bind mount from modules
@@ -188,38 +342,44 @@ detect_all_module_mounts() {
                             mount_dev=$(stat -c %d "$mountpoint" 2>/dev/null)
                             if [ "$real_dev" = "$mount_dev" ] && [ -n "$real_dev" ]; then
                                 echo "bind:$mountpoint"
-                                echo "[HIJACK] Found hidden bind: $mountpoint" >> "$LOG_FILE"
+                                log_info "Found hidden bind: $mountpoint (dev=$real_dev)"
                             fi
                         fi
                     done
                 fi
             fi
         done
-    done < /proc/mounts
+    done
 
     # 4. Loop mounts from module paths
+    log_debug "Phase 4: Scanning loop mounts..."
     if command -v losetup >/dev/null 2>&1; then
         losetup -a 2>/dev/null | grep -E "modules|magisk" | while read -r loop_line; do
             loop_dev=$(echo "$loop_line" | cut -d: -f1)
-            if grep -q "^$loop_dev " /proc/mounts; then
-                loop_mount=$(grep "^$loop_dev " /proc/mounts | awk '{print $2}')
+            if echo "$mounts_snapshot" | grep -q "^$loop_dev "; then
+                loop_mount=$(echo "$mounts_snapshot" | grep "^$loop_dev " | awk '{print $2}')
                 echo "loop:$loop_mount"
-                echo "[HIJACK] Found loop mount: $loop_mount (device: $loop_dev)" >> "$LOG_FILE"
+                log_info "Found loop mount: $loop_mount (device: $loop_dev)"
             fi
         done
+    else
+        log_debug "losetup not available, skipping loop mount detection"
     fi
 
     # 5. tmpfs at suspicious locations (may be used by some modules)
-    while read -r device mountpoint fstype options rest; do
+    log_debug "Phase 5: Scanning tmpfs mounts..."
+    echo "$mounts_snapshot" | while read -r device mountpoint fstype options rest; do
         if [ "$fstype" = "tmpfs" ]; then
             for partition in $TARGET_PARTITIONS; do
                 if echo "$mountpoint" | grep -q "^/$partition"; then
                     echo "tmpfs:$mountpoint"
-                    echo "[HIJACK] Found tmpfs: $mountpoint" >> "$LOG_FILE"
+                    log_info "Found tmpfs: $mountpoint"
                 fi
             done
         fi
-    done < /proc/mounts
+    done
+
+    log_debug "<<< EXIT: detect_all_module_mounts"
 }
 
 # ============================================================
@@ -228,17 +388,22 @@ detect_all_module_mounts() {
 # ============================================================
 is_module_overlay() {
     local mountpoint="$1"
+    log_debug ">>> ENTER: is_module_overlay($mountpoint)"
+
     local mount_line=$(grep " $mountpoint overlay " /proc/mounts 2>/dev/null)
     local options=$(echo "$mount_line" | awk '{print $4}')
+    log_debug "Overlay options: ${options:0:200}..."
 
     # Check if any option contains known module paths
     # Covers: Magisk, KernelSU, APatch module directories
     if echo "$options" | grep -qE "/data/adb/(modules|ksu|ap|magisk)/"; then
+        log_debug "<<< EXIT: is_module_overlay (true - matched /data/adb/* pattern)"
         return 0  # Is a module overlay
     fi
 
     # Check for KernelSU module_root style paths
     if echo "$options" | grep -qE "/data/adb/[^/]+/modules/"; then
+        log_debug "<<< EXIT: is_module_overlay (true - matched KSU module_root)"
         return 0
     fi
 
@@ -248,10 +413,12 @@ is_module_overlay() {
     for mod_dir in "$MODULES_DIR"/*; do
         [ -d "$mod_dir" ] || continue
         if [ -d "$mod_dir/$relative" ] || [ -f "$mod_dir/$relative" ]; then
+            log_debug "<<< EXIT: is_module_overlay (true - module has content: ${mod_dir##*/})"
             return 0  # A module has content for this path
         fi
     done
 
+    log_debug "<<< EXIT: is_module_overlay (false - system overlay)"
     return 1  # System overlay - do not touch
 }
 
@@ -261,27 +428,35 @@ is_module_overlay() {
 # ============================================================
 find_module_for_overlay() {
     local mountpoint="$1"
+    log_debug ">>> ENTER: find_module_for_overlay($mountpoint)"
+
     local mount_line=$(grep " $mountpoint overlay " /proc/mounts 2>/dev/null)
     local options=$(echo "$mount_line" | awk '{print $4}')
 
     # Try lowerdir first (most common)
     local lowerdir=$(echo "$options" | tr ',' '\n' | grep "^lowerdir=" | sed 's/lowerdir=//' | cut -d: -f1)
     if echo "$lowerdir" | grep -q "/data/adb/modules/"; then
-        echo "$lowerdir" | sed 's|.*/data/adb/modules/||' | cut -d/ -f1
+        local result=$(echo "$lowerdir" | sed 's|.*/data/adb/modules/||' | cut -d/ -f1)
+        log_debug "<<< EXIT: find_module_for_overlay (found via lowerdir: $result)"
+        echo "$result"
         return
     fi
 
     # Try upperdir
     local upperdir=$(echo "$options" | tr ',' '\n' | grep "^upperdir=" | sed 's/upperdir=//')
     if echo "$upperdir" | grep -q "/data/adb/modules/"; then
-        echo "$upperdir" | sed 's|.*/data/adb/modules/||' | cut -d/ -f1
+        local result=$(echo "$upperdir" | sed 's|.*/data/adb/modules/||' | cut -d/ -f1)
+        log_debug "<<< EXIT: find_module_for_overlay (found via upperdir: $result)"
+        echo "$result"
         return
     fi
 
     # Try workdir (sometimes contains module path)
     local workdir=$(echo "$options" | tr ',' '\n' | grep "^workdir=" | sed 's/workdir=//')
     if echo "$workdir" | grep -q "/data/adb/modules/"; then
-        echo "$workdir" | sed 's|.*/data/adb/modules/||' | cut -d/ -f1
+        local result=$(echo "$workdir" | sed 's|.*/data/adb/modules/||' | cut -d/ -f1)
+        log_debug "<<< EXIT: find_module_for_overlay (found via workdir: $result)"
+        echo "$result"
         return
     fi
 
@@ -289,12 +464,15 @@ find_module_for_overlay() {
     local all_lowerdirs=$(echo "$options" | tr ',' '\n' | grep "^lowerdir=" | sed 's/lowerdir=//' | tr ':' '\n')
     for dir in $all_lowerdirs; do
         if echo "$dir" | grep -q "/data/adb/modules/"; then
-            echo "$dir" | sed 's|.*/data/adb/modules/||' | cut -d/ -f1
+            local result=$(echo "$dir" | sed 's|.*/data/adb/modules/||' | cut -d/ -f1)
+            log_debug "<<< EXIT: find_module_for_overlay (found via multi-lowerdir: $result)"
+            echo "$result"
             return
         fi
     done
 
     # No module found
+    log_debug "<<< EXIT: find_module_for_overlay (not found)"
     echo ""
 }
 
@@ -304,17 +482,29 @@ find_module_for_overlay() {
 register_sus_map_for_module() {
     local mod_path="$1"
     local mod_name="$2"
+    local so_count=0
 
-    command -v ksu_susfs >/dev/null 2>&1 || return
+    log_debug ">>> ENTER: register_sus_map_for_module($mod_name)"
+
+    if ! command -v ksu_susfs >/dev/null 2>&1; then
+        log_debug "<<< EXIT: register_sus_map_for_module (ksu_susfs not available)"
+        return
+    fi
 
     for partition in $TARGET_PARTITIONS; do
         if [ -d "$mod_path/$partition" ]; then
             find "$mod_path/$partition" -name "*.so" -type f 2>/dev/null | while read -r so_file; do
-                ksu_susfs add_sus_map "$so_file" < /dev/null 2>/dev/null
-                $VERBOSE && echo "  [SUS_MAP] $so_file" >> "$LOG_FILE"
+                if ksu_susfs add_sus_map "$so_file" < /dev/null 2>/dev/null; then
+                    log_debug "SUS_MAP registered: $so_file"
+                    so_count=$((so_count + 1))
+                else
+                    log_err "SUS_MAP failed: $so_file"
+                fi
             done
         fi
     done
+
+    log_debug "<<< EXIT: register_sus_map_for_module (registered $so_count .so files)"
 }
 
 # ============================================================
@@ -323,6 +513,12 @@ register_sus_map_for_module() {
 register_module_vfs() {
     local mod_path="$1"
     local mod_name="$2"
+    local file_count=0
+    local success_count=0
+    local whiteout_count=0
+
+    log_debug ">>> ENTER: register_module_vfs($mod_name)"
+    log_info "Registering VFS files for module: $mod_name"
 
     # Path tracking for monitor.sh to detect file changes later
     local tracking_dir="$NOMOUNT_DATA/module_paths"
@@ -330,28 +526,67 @@ register_module_vfs() {
     mkdir -p "$tracking_dir"
     : > "$tracking_file"
 
+    # Use temp file to accumulate counts (avoids subshell variable isolation from pipe)
+    local count_file="$NOMOUNT_DATA/.vfs_count_$$"
+    echo "0 0 0" > "$count_file"  # file_count success_count whiteout_count
+
     for partition in $TARGET_PARTITIONS; do
         if [ -d "$mod_path/$partition" ]; then
-            (
-                cd "$mod_path" || exit
-                find "$partition" -type f -o -type c 2>/dev/null | while read -r relative_path; do
-                    real_path="$mod_path/$relative_path"
-                    virtual_path="/$relative_path"
+            log_debug "Processing partition: $partition"
+            # Use absolute paths to avoid cd/subshell - find from mod_path, strip prefix for virtual path
+            find "$mod_path/$partition" -type f -o -type c 2>/dev/null | while read -r real_path; do
+                # Convert absolute real_path to relative virtual_path
+                virtual_path="${real_path#$mod_path}"
 
-                    if [ -c "$real_path" ]; then
-                        $VERBOSE && echo "  [VFS] Whiteout: $virtual_path" >> "$LOG_FILE"
-                        "$LOADER" add "$virtual_path" "/nonexistent" < /dev/null 2>/dev/null
+                # Read current counts
+                read f_cnt s_cnt w_cnt < "$count_file"
+                f_cnt=$((f_cnt + 1))
+
+                if [ -c "$real_path" ]; then
+                    log_debug "VFS Whiteout: $virtual_path"
+                    if "$LOADER" add "$virtual_path" "/nonexistent" < /dev/null 2>/dev/null; then
+                        w_cnt=$((w_cnt + 1))
+                        s_cnt=$((s_cnt + 1))
+                        # Increment global counter via temp file
+                        echo "VFS_INC" >> "$count_file.global"
                     else
-                        $VERBOSE && echo "  [VFS] Inject: $virtual_path" >> "$LOG_FILE"
-                        "$LOADER" add "$virtual_path" "$real_path" < /dev/null 2>/dev/null
+                        log_err "VFS add failed (whiteout): $virtual_path"
                     fi
+                else
+                    log_debug "VFS Inject: $virtual_path -> $real_path"
+                    if "$LOADER" add "$virtual_path" "$real_path" < /dev/null 2>/dev/null; then
+                        s_cnt=$((s_cnt + 1))
+                        # Increment global counter via temp file
+                        echo "VFS_INC" >> "$count_file.global"
+                    else
+                        log_err "VFS add failed (inject): $virtual_path"
+                    fi
+                fi
 
-                    # Track for later sync
-                    echo "$virtual_path" >> "$tracking_file"
-                done
-            )
+                # Write updated counts
+                echo "$f_cnt $s_cnt $w_cnt" > "$count_file"
+
+                # Track for later sync
+                echo "$virtual_path" >> "$tracking_file"
+            done
         fi
     done
+
+    # Read final counts from temp file
+    if [ -f "$count_file" ]; then
+        read file_count success_count whiteout_count < "$count_file"
+        rm -f "$count_file"
+    fi
+
+    # Update global VFS_REGISTERED_COUNT from marker file
+    if [ -f "$count_file.global" ]; then
+        local global_inc=$(wc -l < "$count_file.global")
+        VFS_REGISTERED_COUNT=$((VFS_REGISTERED_COUNT + global_inc))
+        rm -f "$count_file.global"
+    fi
+
+    log_info "Module $mod_name: registered files via VFS"
+    log_debug "<<< EXIT: register_module_vfs (files=$file_count, success=$success_count, whiteouts=$whiteout_count)"
 
     register_sus_map_for_module "$mod_path" "$mod_name"
 }
@@ -364,12 +599,14 @@ hijack_mount() {
     local mount_type="${mount_info%%:*}"
     local mountpoint="${mount_info#*:}"
 
-    echo "[HIJACK] Processing $mount_type mount: $mountpoint" >> "$LOG_FILE"
+    log_debug ">>> ENTER: hijack_mount($mount_info)"
+    log_info "Processing $mount_type mount: $mountpoint"
 
     # CRITICAL: For overlay mounts, verify it's from a module, not Android system
     if [ "$mount_type" = "overlay" ]; then
         if ! is_module_overlay "$mountpoint"; then
-            echo "  [SKIP] System overlay (not from module) - preserving" >> "$LOG_FILE"
+            log_info "SKIP: System overlay (not from module) - preserving"
+            log_debug "<<< EXIT: hijack_mount (skipped system overlay)"
             return 0
         fi
     fi
@@ -377,6 +614,7 @@ hijack_mount() {
     local mod_name=""
 
     # Find owning module based on mount type
+    log_debug "Looking for owning module (mount_type=$mount_type)"
     case "$mount_type" in
         overlay)
             mod_name=$(find_module_for_overlay "$mountpoint")
@@ -392,6 +630,7 @@ hijack_mount() {
                         local relative="${mountpoint#/}"
                         if [ -e "$mod_dir/$relative" ]; then
                             mod_name="$test_mod"
+                            log_debug "Found module via directory scan: $mod_name"
                             break 2
                         fi
                     fi
@@ -401,42 +640,54 @@ hijack_mount() {
     esac
 
     if [ -z "$mod_name" ]; then
-        echo "  [WARN] Could not determine module for $mountpoint" >> "$LOG_FILE"
+        log_err "Could not determine owning module for mount: $mountpoint"
+        log_debug "<<< EXIT: hijack_mount (no module found)"
         return 1
     fi
 
     local mod_path="$MODULES_DIR/$mod_name"
-    echo "  [INFO] Module: $mod_name (type: $mount_type)" >> "$LOG_FILE"
+    log_info "Mount owned by module: $mod_name (type: $mount_type)"
 
     if is_excluded "$mod_name"; then
-        echo "  [SKIP] Module is in exclusion list" >> "$LOG_FILE"
+        log_info "SKIP: Module $mod_name is in exclusion list"
+        log_debug "<<< EXIT: hijack_mount (excluded)"
         return 0
     fi
 
     # Content-aware filtering (skip hosts-modifying modules, skip_nomount markers)
     if should_skip_module "$mod_path" "$mod_name"; then
+        log_debug "<<< EXIT: hijack_mount (filtered by should_skip_module)"
         return 0
     fi
 
     if [ ! -d "$mod_path" ]; then
-        echo "  [WARN] Module directory not found: $mod_path" >> "$LOG_FILE"
+        log_err "Module directory not found: $mod_path"
+        log_debug "<<< EXIT: hijack_mount (mod_path missing)"
         return 1
     fi
 
-    echo "  [VFS] Registering files..." >> "$LOG_FILE"
+    log_info "Registering VFS files for mount $mountpoint..."
     register_module_vfs "$mod_path" "$mod_name"
 
-    echo "  [UNMOUNT] Attempting lazy unmount..." >> "$LOG_FILE"
-    if umount -l "$mountpoint" 2>/dev/null; then
-        echo "  [OK] Unmounted: $mountpoint" >> "$LOG_FILE"
+    log_info "Attempting lazy unmount: $mountpoint"
+    local umount_output
+    umount_output=$(umount -l "$mountpoint" 2>&1)
+    local umount_rc=$?
+
+    if [ $umount_rc -eq 0 ]; then
+        log_info "Successfully unmounted: $mountpoint"
         HIJACKED_OVERLAYS_COUNT=$((HIJACKED_OVERLAYS_COUNT + 1))
+        log_debug "<<< EXIT: hijack_mount (success)"
         return 0
     else
+        log_err "Unmount failed (rc=$umount_rc): $mountpoint - $umount_output"
         if [ "$aggressive_mode" = "true" ]; then
-            echo "  [WARN] Unmount failed, aggressive mode - continuing" >> "$LOG_FILE"
+            log_info "Aggressive mode enabled - continuing despite unmount failure"
+            log_debug "<<< EXIT: hijack_mount (unmount failed, aggressive mode)"
             return 0
         else
-            echo "  [WARN] Unmount failed, keeping mount as fallback" >> "$LOG_FILE"
+            log_info "Keeping mount as fallback (aggressive_mode=false)"
+            log_debug "<<< EXIT: hijack_mount (unmount failed)"
             return 1
         fi
     fi
@@ -446,32 +697,72 @@ hijack_mount() {
 # FUNCTION: Process modules directly via VFS
 # ============================================================
 process_modules_direct() {
-    echo "[DIRECT] Processing modules via VFS..." >> "$LOG_FILE"
+    log_debug ">>> ENTER: process_modules_direct"
+    log_info "Processing modules directly via VFS..."
+
+    local total_modules=0
+    local skipped_disabled=0
+    local skipped_excluded=0
+    local skipped_no_content=0
 
     for mod_path in "$MODULES_DIR"/*; do
         [ -d "$mod_path" ] || continue
         mod_name="${mod_path##*/}"
+        total_modules=$((total_modules + 1))
 
-        [ "$mod_name" = "nomount" ] && continue
-        [ -f "$mod_path/disable" ] && continue
-        [ -f "$mod_path/remove" ] && continue
+        log_debug "Checking module: $mod_name"
 
-        is_excluded "$mod_name" && continue
+        if [ "$mod_name" = "nomount" ]; then
+            log_debug "Skipping self (nomount module)"
+            skipped_excluded=$((skipped_excluded + 1))
+            continue
+        fi
+
+        if [ -f "$mod_path/disable" ]; then
+            log_debug "Skipping $mod_name (has disable flag)"
+            skipped_disabled=$((skipped_disabled + 1))
+            continue
+        fi
+
+        if [ -f "$mod_path/remove" ]; then
+            log_debug "Skipping $mod_name (has remove flag)"
+            skipped_disabled=$((skipped_disabled + 1))
+            continue
+        fi
+
+        if is_excluded "$mod_name"; then
+            skipped_excluded=$((skipped_excluded + 1))
+            continue
+        fi
 
         # Content-aware filtering
-        should_skip_module "$mod_path" "$mod_name" && continue
+        if should_skip_module "$mod_path" "$mod_name"; then
+            skipped_excluded=$((skipped_excluded + 1))
+            continue
+        fi
 
         has_content=false
         for partition in $TARGET_PARTITIONS; do
-            [ -d "$mod_path/$partition" ] && has_content=true && break
+            if [ -d "$mod_path/$partition" ]; then
+                has_content=true
+                log_debug "Module $mod_name has content in /$partition"
+                break
+            fi
         done
 
         if [ "$has_content" = "true" ]; then
-            echo "[DIRECT] Processing: $mod_name" >> "$LOG_FILE"
+            log_info "Processing module: $mod_name"
             register_module_vfs "$mod_path" "$mod_name"
             ACTIVE_MODULES_COUNT=$((ACTIVE_MODULES_COUNT + 1))
+        else
+            log_debug "Skipping $mod_name (no partition content)"
+            skipped_no_content=$((skipped_no_content + 1))
         fi
     done
+
+    log_info "Direct processing complete: $ACTIVE_MODULES_COUNT modules processed"
+    log_debug "Stats: total=$total_modules, disabled=$skipped_disabled, excluded=$skipped_excluded, no_content=$skipped_no_content"
+    log_debug "<<< EXIT: process_modules_direct"
 }
 
 # ============================================================
@@ -479,9 +770,16 @@ process_modules_direct() {
 # Must run EARLY before overlays change device IDs
 # ============================================================
 cache_partition_devs() {
-    log "Phase 1: Caching partition device IDs..."
+    log_debug ">>> ENTER: cache_partition_devs"
+    log_info "Phase 1: Caching partition device IDs..."
+
+    # Partition IDs must match kernel enum: system=0, vendor=1, product=2, system_ext=3,
+    # odm=4, oem=5, mi_ext=6, my_heytap=7, prism=8, optics=9, oem_dlkm=10, system_dlkm=11, vendor_dlkm=12
     local part_id=0
-    for partition in system vendor product system_ext odm oem; do
+    local cached_count=0
+    local missing_count=0
+
+    for partition in system vendor product system_ext odm oem mi_ext my_heytap prism optics oem_dlkm system_dlkm vendor_dlkm; do
         if [ -d "/$partition" ]; then
             # Use %d to get decimal device ID, then extract major/minor
             # Device ID = major * 256 + minor (standard Linux encoding)
@@ -489,14 +787,28 @@ cache_partition_devs() {
             if [ -n "$dev_dec" ] && [ "$dev_dec" -gt 0 ]; then
                 local major=$((dev_dec >> 8))
                 local minor=$((dev_dec & 255))
-                "$LOADER" setdev "$part_id" "$major" "$minor" 2>/dev/null
-                log "  /$partition -> $major:$minor"
+                local nm_output
+                nm_output=$("$LOADER" setdev "$part_id" "$major" "$minor" 2>&1)
+                local nm_rc=$?
+                if [ $nm_rc -eq 0 ]; then
+                    log_info "Partition /$partition (id=$part_id) -> $major:$minor"
+                    cached_count=$((cached_count + 1))
+                else
+                    log_err "nm setdev failed for /$partition: $nm_output (rc=$nm_rc)"
+                fi
             else
-                log "  /$partition -> (not mounted or invalid)"
+                log_debug "Partition /$partition -> not mounted or invalid (dev_dec=$dev_dec)"
+                missing_count=$((missing_count + 1))
             fi
+        else
+            log_debug "Partition /$partition does not exist"
+            missing_count=$((missing_count + 1))
         fi
         part_id=$((part_id + 1))
     done
+
+    log_info "Phase 1 complete: $cached_count partitions cached, $missing_count not found"
+    log_debug "<<< EXIT: cache_partition_devs"
 }
 
 # ============================================================
@@ -504,8 +816,14 @@ cache_partition_devs() {
 # Hides overlay/tmpfs mounts from /proc/mounts, /proc/self/mountinfo
 # ============================================================
 register_hidden_mounts() {
-    log "Phase 2: Registering hidden mounts..."
+    log_debug ">>> ENTER: register_hidden_mounts"
+    log_info "Phase 2: Registering hidden mounts..."
+
     local count=0
+    local fail_count=0
+    local total_mounts=$(wc -l < /proc/self/mountinfo)
+    log_debug "Total mounts in mountinfo: $total_mounts"
+
     while IFS=' ' read -r mount_id rest; do
         local fstype=$(echo "$rest" | sed 's/.* - //' | cut -d' ' -f1)
         local mount_point=$(echo "$rest" | cut -d' ' -f4)
@@ -514,17 +832,26 @@ register_hidden_mounts() {
             overlay|tmpfs)
                 for partition in $TARGET_PARTITIONS; do
                     if echo "$mount_point" | grep -qE "^/$partition(/|$)"; then
-                        "$LOADER" hide "$mount_id" 2>/dev/null && {
-                            log "  Hidden: $mount_id ($fstype @ $mount_point)"
+                        log_debug "Attempting to hide mount_id=$mount_id ($fstype @ $mount_point)"
+                        local hide_output
+                        hide_output=$("$LOADER" hide "$mount_id" 2>&1)
+                        local hide_rc=$?
+                        if [ $hide_rc -eq 0 ]; then
+                            log_info "Hidden mount: $mount_id ($fstype @ $mount_point)"
                             count=$((count + 1))
-                        }
+                        else
+                            log_err "Failed to hide mount $mount_id: $hide_output (rc=$hide_rc)"
+                            fail_count=$((fail_count + 1))
+                        fi
                         break
                     fi
                 done
                 ;;
         esac
     done < /proc/self/mountinfo
-    log "  Total: $count mounts hidden"
+
+    log_info "Phase 2 complete: $count mounts hidden, $fail_count failed"
+    log_debug "<<< EXIT: register_hidden_mounts"
 }
 
 # ============================================================
@@ -532,77 +859,212 @@ register_hidden_mounts() {
 # Hides suspicious paths from /proc/self/maps
 # ============================================================
 register_maps_patterns() {
-    log "Phase 3: Registering maps patterns..."
+    log_debug ">>> ENTER: register_maps_patterns"
+    log_info "Phase 3: Registering maps patterns..."
+
+    local count=0
+    local fail_count=0
+
     for pattern in "/data/adb" "magisk" "kernelsu" "zygisk"; do
-        "$LOADER" addmap "$pattern" 2>/dev/null
-        log "  Pattern: $pattern"
+        local addmap_output
+        addmap_output=$("$LOADER" addmap "$pattern" 2>&1)
+        local addmap_rc=$?
+        if [ $addmap_rc -eq 0 ]; then
+            log_info "Maps pattern registered: $pattern"
+            count=$((count + 1))
+        else
+            log_err "Failed to register maps pattern '$pattern': $addmap_output (rc=$addmap_rc)"
+            fail_count=$((fail_count + 1))
+        fi
     done
+
+    log_info "Phase 3 complete: $count patterns registered, $fail_count failed"
+    log_debug "<<< EXIT: register_maps_patterns"
 }
 
 # ============================================================
 # MAIN EXECUTION (late boot phase)
 # ============================================================
+log_info "========== MAIN EXECUTION STARTING =========="
+log_info "Configuration: universal_hijack=$universal_hijack, aggressive_mode=$aggressive_mode"
+log_info "Configuration: monitor_new_modules=$monitor_new_modules, skip_hosts_modules=$skip_hosts_modules"
+log_debug "Excluded modules: ${excluded_modules:-none}"
 
 # ============================================================
 # SUSFS-INDEPENDENT VFS HIDING (Phases 1-3)
 # These run BEFORE file registration for complete detection evasion
 # ============================================================
-log "========== SUSFS-INDEPENDENT VFS HIDING =========="
+log_info "========== SUSFS-INDEPENDENT VFS HIDING =========="
 cache_partition_devs
 register_hidden_mounts
 register_maps_patterns
-log ""
+log_info ""
 
 if [ "$universal_hijack" = "true" ]; then
-    echo "========== UNIVERSAL HIJACKER MODE ==========" >> "$LOG_FILE"
+    log_info "========== UNIVERSAL HIJACKER MODE =========="
 
     # Phase 1: Detect and hijack ALL existing mounts (overlay, bind, loop, tmpfs)
+    log_info "Detecting all module-related mounts..."
     mount_list=$(detect_all_module_mounts)
+    mount_count=$(echo "$mount_list" | grep -c . || echo 0)
+    log_info "Detected $mount_count module-related mounts"
 
     if [ -n "$mount_list" ]; then
-        echo "" >> "$LOG_FILE"
-        echo "[HIJACK] Hijacking ALL detected mounts..." >> "$LOG_FILE"
+        log_info ""
+        log_info "Hijacking all detected mounts..."
+
+        local hijack_success=0
+        local hijack_fail=0
 
         # Use here-string to avoid subshell variable loss
         while read -r mount_info; do
-            [ -n "$mount_info" ] && hijack_mount "$mount_info"
+            if [ -n "$mount_info" ]; then
+                if hijack_mount "$mount_info"; then
+                    hijack_success=$((hijack_success + 1))
+                else
+                    hijack_fail=$((hijack_fail + 1))
+                fi
+            fi
         done <<EOF
 $mount_list
 EOF
 
-        echo "[HIJACK] Complete" >> "$LOG_FILE"
+        log_info "Hijacking complete: $hijack_success successful, $hijack_fail failed"
     else
-        echo "[HIJACK] No module-related mounts detected" >> "$LOG_FILE"
+        log_info "No module-related mounts detected"
     fi
 
     # Phase 2: Process all modules directly via VFS
-    echo "" >> "$LOG_FILE"
+    log_info ""
     process_modules_direct
 
 else
-    echo "========== STANDARD MODE ==========" >> "$LOG_FILE"
+    log_info "========== STANDARD MODE =========="
     process_modules_direct
 fi
 
 # Handle UID exclusion list
 if [ -f "$NOMOUNT_DATA/.exclusion_list" ]; then
-    echo "" >> "$LOG_FILE"
-    echo "[UID] Processing exclusion list..." >> "$LOG_FILE"
+    log_info ""
+    log_info "Processing UID exclusion list..."
+    local uid_count=0
+    local uid_fail=0
     while IFS= read -r uid; do
         [ -z "$uid" ] && continue
-        "$LOADER" blk "$uid" 2>/dev/null
-        echo "  [UID] Blocked: $uid" >> "$LOG_FILE"
+        local blk_output
+        blk_output=$("$LOADER" blk "$uid" 2>&1)
+        local blk_rc=$?
+        if [ $blk_rc -eq 0 ]; then
+            log_info "UID blocked: $uid"
+            uid_count=$((uid_count + 1))
+        else
+            log_err "Failed to block UID $uid: $blk_output (rc=$blk_rc)"
+            uid_fail=$((uid_fail + 1))
+        fi
     done < "$NOMOUNT_DATA/.exclusion_list"
+    log_info "UID processing complete: $uid_count blocked, $uid_fail failed"
+else
+    log_debug "No UID exclusion list found at $NOMOUNT_DATA/.exclusion_list"
 fi
 
+# Calculate execution time
+END_TIME=$(date +%s)
+ELAPSED=$((END_TIME - START_TIME))
+
 # Summary
-echo "" >> "$LOG_FILE"
-echo "========== SUMMARY ==========" >> "$LOG_FILE"
-echo "Modules processed: $ACTIVE_MODULES_COUNT" >> "$LOG_FILE"
-echo "Overlays hijacked: $HIJACKED_OVERLAYS_COUNT" >> "$LOG_FILE"
-echo "Completed: $(date)" >> "$LOG_FILE"
+log_info ""
+log_info "========== EXECUTION SUMMARY =========="
+log_info "Framework: $FRAMEWORK"
+log_info "Mode: $([ \"$universal_hijack\" = \"true\" ] && echo 'Universal Hijacker' || echo 'Standard')"
+log_info "Modules processed: $ACTIVE_MODULES_COUNT"
+log_info "Overlays hijacked: $HIJACKED_OVERLAYS_COUNT"
+log_info "VFS files registered: $VFS_REGISTERED_COUNT"
+log_info "Failed operations: $FAILED_COUNT"
+log_info "Execution time: ${ELAPSED}s"
+log_info "Completed: $(date)"
+log_info "=========================================="
+
+# ============================================================
+# Save VFS rules to cache for early boot registration
+# This allows post-fs-data.sh to pre-register rules on next boot
+# BEFORE zygote starts, closing the detection window.
+# ============================================================
+save_rule_cache() {
+    local cache_file="$NOMOUNT_DATA/.rule_cache"
+    local temp_file="$NOMOUNT_DATA/.rule_cache_tmp_$$"
+
+    log_info "Saving VFS rules to cache for early boot..."
+
+    # Clear temp file
+    : > "$temp_file"
+
+    # Add header comment
+    echo "# NoMount VFS Rule Cache" >> "$temp_file"
+    echo "# Generated: $(date)" >> "$temp_file"
+    echo "# Format: cmd|arg1|arg2" >> "$temp_file"
+    echo "# Commands: add (vpath|rpath), hide (mount_id|), setdev (part_id|major:minor), addmap (pattern|)" >> "$temp_file"
+
+    # Get current VFS rules from kernel via nm list
+    # Kernel returns: real_path->virtual_path
+    local list_output
+    list_output=$("$LOADER" list 2>/dev/null)
+    local list_rc=$?
+
+    if [ $list_rc -eq 0 ] && [ -n "$list_output" ]; then
+        echo "$list_output" | while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            # Parse kernel format: real_path->virtual_path
+            local rpath="${line%%->*}"
+            local vpath="${line##*->}"
+            [ -n "$vpath" ] && [ -n "$rpath" ] && echo "add|$vpath|$rpath" >> "$temp_file"
+        done
+    else
+        log_debug "nm list returned no rules or failed (rc=$list_rc)"
+    fi
+
+    # Also cache partition device IDs for stat spoofing
+    # These are critical for early detection evasion
+    local part_id=0
+    for partition in system vendor product system_ext odm oem mi_ext my_heytap prism optics oem_dlkm system_dlkm vendor_dlkm; do
+        if [ -d "/$partition" ]; then
+            local dev_dec=$(stat -c '%d' "/$partition" 2>/dev/null)
+            if [ -n "$dev_dec" ] && [ "$dev_dec" -gt 0 ]; then
+                local major=$((dev_dec >> 8))
+                local minor=$((dev_dec & 255))
+                echo "setdev|$part_id|$major:$minor" >> "$temp_file"
+            fi
+        fi
+        part_id=$((part_id + 1))
+    done
+
+    # Cache maps patterns for /proc/self/maps filtering
+    for pattern in "/data/adb" "magisk" "kernelsu" "zygisk"; do
+        echo "addmap|$pattern|" >> "$temp_file"
+    done
+
+    # Atomic replace using rename
+    if mv "$temp_file" "$cache_file" 2>/dev/null; then
+        local count=$(grep -c "^add|" "$cache_file" 2>/dev/null || echo 0)
+        local setdev_count=$(grep -c "^setdev|" "$cache_file" 2>/dev/null || echo 0)
+        local addmap_count=$(grep -c "^addmap|" "$cache_file" 2>/dev/null || echo 0)
+        log_info "Rule cache saved: $count add rules, $setdev_count setdev, $addmap_count addmap"
+
+        # Set restrictive permissions
+        chmod 600 "$cache_file" 2>/dev/null
+    else
+        log_err "Failed to save rule cache (mv failed)"
+        rm -f "$temp_file" 2>/dev/null
+    fi
+}
+
+# Call save_rule_cache at end of successful execution
+save_rule_cache
 
 # Start monitor
 if [ "$monitor_new_modules" = "true" ]; then
+    log_info "Starting monitor.sh with args: $ACTIVE_MODULES_COUNT $HIJACKED_OVERLAYS_COUNT"
     sh "$MODDIR/monitor.sh" "$ACTIVE_MODULES_COUNT" "$HIJACKED_OVERLAYS_COUNT" &
+    log_debug "Monitor started with PID: $!"
+else
+    log_debug "Monitor disabled (monitor_new_modules=false)"
 fi

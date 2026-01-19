@@ -149,6 +149,46 @@ struct nm_partition_dev {
 #define NM_ACTIVE 1
 #define NM_DIR    128
 #define PATH_MAX  4096
+#define LIST_BUF_SIZE 65536
+
+/* Static buffer for list output (safer than stack arithmetic) */
+static char list_buffer[LIST_BUF_SIZE];
+
+/* Static buffers to replace dangerous stack pointer arithmetic */
+static char path_buffer[PATH_MAX];
+static unsigned int stat_buffer[32];  /* stat struct buffer */
+static int int_buffer;                /* For single int ioctl args */
+static struct nm_partition_dev pd_buffer;  /* For setdev command */
+
+/* Parse integer with validation - returns 0 on success, -1 on error */
+static int parse_int(const char *s, int *out) {
+    if (!s || !*s) return -1;
+    int val = 0;
+    while (*s) {
+        if (*s < '0' || *s > '9') return -1;  /* Not a digit */
+        int prev = val;
+        val = val * 10 + (*s - '0');
+        if (val < prev) return -1;  /* Overflow */
+        s++;
+    }
+    *out = val;
+    return 0;
+}
+
+/* Parse unsigned int with validation */
+static int parse_uint(const char *s, unsigned int *out) {
+    if (!s || !*s) return -1;
+    unsigned int val = 0;
+    while (*s) {
+        if (*s < '0' || *s > '9') return -1;
+        unsigned int prev = val;
+        val = val * 10 + (*s - '0');
+        if (val < prev) return -1;  /* Overflow */
+        s++;
+    }
+    *out = val;
+    return 0;
+}
 
 /* --- MAIN --- */
 __attribute__((noreturn, used))
@@ -174,8 +214,9 @@ void c_main(long *sp) {
     unsigned int uid = 0;
     long ioctl_code = 0;
     int needed = 2;
-    if (cmd == 'a') needed = 4;
-    else if (cmd != 'c' && cmd != 'v' && cmd != 'l') needed = 3; 
+    /* 'add' needs 4 args, but 'addmap' only needs 3 - check 4th char to distinguish */
+    if (cmd == 'a' && argv[1][1] == 'd' && argv[1][2] == 'd' && argv[1][3] != 'm') needed = 4;
+    else if (cmd != 'c' && cmd != 'v' && cmd != 'l' && cmd != 'a') needed = 3; 
     
     if (argc < needed) goto do_exit;
 
@@ -198,45 +239,35 @@ void c_main(long *sp) {
     /* unhide <mount_id> - Unhide mount */
     else if (cmd == 'u' && argv[1][1] == 'n' && argv[1][2] == 'h') {
         if (argc < 3) goto do_exit;
-        const char *s = argv[2];
-        int mount_id = 0;
-        while (*s) mount_id = mount_id * 10 + (*s++ - '0');
-        *(int *)((char *)sp - 256) = mount_id;
-        ioctl_arg = (void *)((char *)sp - 256);
+        int mount_id;
+        if (parse_int(argv[2], &mount_id) < 0) goto do_exit;
+        int_buffer = mount_id;
+        ioctl_arg = &int_buffer;
         ioctl_code = IOCTL_UNHIDE_MOUNT;
     }
     /* hide <mount_id> - Hide mount from /proc/mounts */
     else if (cmd == 'h' && argv[1][1] == 'i') {
         if (argc < 3) goto do_exit;
-        const char *s = argv[2];
-        int mount_id = 0;
-        while (*s) mount_id = mount_id * 10 + (*s++ - '0');
-        *(int *)((char *)sp - 256) = mount_id;
-        ioctl_arg = (void *)((char *)sp - 256);
+        int mount_id;
+        if (parse_int(argv[2], &mount_id) < 0) goto do_exit;
+        int_buffer = mount_id;
+        ioctl_arg = &int_buffer;
         ioctl_code = IOCTL_HIDE_MOUNT;
     }
     /* setdev <partition_id> <major> <minor> - Set partition device numbers */
     else if (cmd == 's' && argv[1][1] == 'e' && argv[1][2] == 't') {
         if (argc < 5) goto do_exit;
-        struct nm_partition_dev *pd = (struct nm_partition_dev *)((char *)sp - 256);
-        const char *s;
 
         /* Parse partition_id */
-        s = argv[2];
-        pd->partition_id = 0;
-        while (*s) pd->partition_id = pd->partition_id * 10 + (*s++ - '0');
+        if (parse_int(argv[2], &pd_buffer.partition_id) < 0) goto do_exit;
 
         /* Parse major */
-        s = argv[3];
-        pd->dev_major = 0;
-        while (*s) pd->dev_major = pd->dev_major * 10 + (*s++ - '0');
+        if (parse_uint(argv[3], &pd_buffer.dev_major) < 0) goto do_exit;
 
         /* Parse minor */
-        s = argv[4];
-        pd->dev_minor = 0;
-        while (*s) pd->dev_minor = pd->dev_minor * 10 + (*s++ - '0');
+        if (parse_uint(argv[4], &pd_buffer.dev_minor) < 0) goto do_exit;
 
-        ioctl_arg = pd;
+        ioctl_arg = &pd_buffer;
         ioctl_code = IOCTL_SET_PARTITION_DEV;
     }
 
@@ -256,17 +287,24 @@ void c_main(long *sp) {
         } else {
             char *src = argv[3];
             char *dst_ptr;
-            char *path_buf = (char *)sp;
 
             if (src[0] != '/') {
-                long l = sys2(SYS_GETCWD, (long)path_buf, PATH_MAX);
+                long l = sys2(SYS_GETCWD, (long)path_buffer, PATH_MAX);
                 if (l > 0) {
-                    if (path_buf[l-1] == 0) l--;
-                    path_buf[l] = '/';
+                    if (path_buffer[l-1] == 0) l--;
+                    /* Check bounds before concatenating */
+                    size_t src_len = 0;
+                    const char *p = src;
+                    while (*p++) src_len++;
+                    if ((size_t)l + 1 + src_len >= PATH_MAX) {
+                        exit_code = 4;  /* Path too long */
+                        goto do_exit;
+                    }
+                    path_buffer[l] = '/';
                     char *s = src;
-                    char *d = path_buf + l + 1;
+                    char *d = path_buffer + l + 1;
                     while ((*d++ = *s++));
-                    dst_ptr = path_buf;
+                    dst_ptr = path_buffer;
                 } else {
                     dst_ptr = src;
                 }
@@ -283,17 +321,15 @@ void c_main(long *sp) {
 
             data.flags = NM_ACTIVE;
 
-            unsigned int *stat_buf = (unsigned int *)((char*)sp + 256);
-            if (sys4(SYS_FSTATAT, AT_FDCWD, (long)dst_ptr, (long)stat_buf, 0) == 0) {
-                unsigned int mode = stat_buf[STAT_MODE_IDX];
+            if (sys4(SYS_FSTATAT, AT_FDCWD, (long)dst_ptr, (long)stat_buffer, 0) == 0) {
+                unsigned int mode = stat_buffer[STAT_MODE_IDX];
                 if ((mode & 0170000) == 0040000) data.flags |= NM_DIR;
             }
             ioctl_code = IOCTL_ADD;
         }
     }
     else if (cmd == 'b' || cmd == 'u') {
-        const char *s = argv[2];
-        while (*s) uid = uid * 10 + (*s++ - '0');
+        if (parse_uint(argv[2], &uid) < 0) goto do_exit;
         ioctl_arg = &uid;
         ioctl_code = (cmd == 'b') ? IOCTL_ADD_UID : IOCTL_DEL_UID;
     }
@@ -305,7 +341,7 @@ void c_main(long *sp) {
     }
     else if (cmd == 'l') {
         ioctl_code = IOCTL_LIST;
-        ioctl_arg = (void *)((char *)sp - 65536);
+        ioctl_arg = (void *)list_buffer;
     }
 
     if (ioctl_code) {
