@@ -1773,7 +1773,7 @@ new file mode 100644
 index 000000000..9e0fb1b21
 --- /dev/null
 +++ b/include/linux/vfs_dcache.h
-@@ -0,0 +1,186 @@
+@@ -0,0 +1,188 @@
 +#ifndef _LINUX_VFS_DCACHE_H
 +#define _LINUX_VFS_DCACHE_H
 +
