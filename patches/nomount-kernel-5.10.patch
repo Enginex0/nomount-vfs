@@ -202,6 +202,44 @@ index 000000000..43ca3f0fa
 +
 +#define STOCK_ANDROID_TIME 1230768000
 +
++/* Use bit 40 of address_space flags for fast hide check (like HymoFS) */
++#define AS_NOMOUNT_HAS_HIDDEN	40
++
++static void nomount_mark_parent_has_hidden(const char *virtual_path)
++{
++	char *parent_path;
++	char *last_slash;
++	struct path parent;
++
++	if (!virtual_path || strlen(virtual_path) < 2)
++		return;
++
++	parent_path = kstrdup(virtual_path, GFP_KERNEL);
++	if (!parent_path)
++		return;
++
++	last_slash = strrchr(parent_path, '/');
++	if (last_slash && last_slash != parent_path) {
++		*last_slash = '\0';
++		if (kern_path(parent_path, LOOKUP_FOLLOW, &parent) == 0) {
++			if (parent.dentry && parent.dentry->d_inode &&
++			    parent.dentry->d_inode->i_mapping) {
++				set_bit(AS_NOMOUNT_HAS_HIDDEN, &parent.dentry->d_inode->i_mapping->flags);
++			}
++			path_put(&parent);
++		}
++	}
++	kfree(parent_path);
++}
++
++bool nomount_parent_has_hidden_fast(struct inode *dir_inode)
++{
++	if (!dir_inode || !dir_inode->i_mapping)
++		return false;
++	return test_bit(AS_NOMOUNT_HAS_HIDDEN, &dir_inode->i_mapping->flags);
++}
++EXPORT_SYMBOL(nomount_parent_has_hidden_fast);
++
 +static bool nomount_is_uid_blocked(uid_t uid) {
 +	struct nomount_uid_node *entry;
 +	if (NOMOUNT_DISABLED()) return false;
@@ -280,6 +318,62 @@ index 000000000..43ca3f0fa
 +		return nm_partition_devs[NM_PART_OEM];
 +
 +	return 0;
++}
++
++static void nomount_get_parent_timestamps(const char *path, struct kstat *stat)
++{
++	char *parent_path;
++	char *last_slash;
++	struct path parent;
++	struct kstat parent_stat;
++
++	if (!path || strlen(path) < 2)
++		return;
++
++	parent_path = kstrdup(path, GFP_KERNEL);
++	if (!parent_path)
++		return;
++
++	last_slash = strrchr(parent_path, '/');
++	if (last_slash && last_slash != parent_path) {
++		*last_slash = '\0';
++	} else {
++		/* Root directory - use static time */
++		kfree(parent_path);
++		stat->atime.tv_sec = STOCK_ANDROID_TIME;
++		stat->mtime.tv_sec = STOCK_ANDROID_TIME;
++		stat->ctime.tv_sec = STOCK_ANDROID_TIME;
++		stat->atime.tv_nsec = 0;
++		stat->mtime.tv_nsec = 0;
++		stat->ctime.tv_nsec = 0;
++		return;
++	}
++
++	if (kern_path(parent_path, LOOKUP_FOLLOW, &parent) == 0) {
++		if (vfs_getattr(&parent, &parent_stat, STATX_BASIC_STATS, AT_STATX_SYNC_AS_STAT) == 0) {
++			stat->atime = parent_stat.atime;
++			stat->mtime = parent_stat.mtime;
++			stat->ctime = parent_stat.ctime;
++		} else {
++			/* Fallback to static */
++			stat->atime.tv_sec = STOCK_ANDROID_TIME;
++			stat->mtime.tv_sec = STOCK_ANDROID_TIME;
++			stat->ctime.tv_sec = STOCK_ANDROID_TIME;
++			stat->atime.tv_nsec = 0;
++			stat->mtime.tv_nsec = 0;
++			stat->ctime.tv_nsec = 0;
++		}
++		path_put(&parent);
++	} else {
++		/* Fallback to static */
++		stat->atime.tv_sec = STOCK_ANDROID_TIME;
++		stat->mtime.tv_sec = STOCK_ANDROID_TIME;
++		stat->ctime.tv_sec = STOCK_ANDROID_TIME;
++		stat->atime.tv_nsec = 0;
++		stat->mtime.tv_nsec = 0;
++		stat->ctime.tv_nsec = 0;
++	}
++	kfree(parent_path);
 +}
 +
 +bool nomount_match_path(const char *input_path, const char *rule_path) {
@@ -522,12 +616,8 @@ index 000000000..43ca3f0fa
 +		if (rule->real_ino == inode->i_ino) {
 +			stat->dev = nomount_get_partition_dev(rule->virtual_path);
 +			stat->ino = rule->virtual_ino;
-+			stat->atime.tv_sec = STOCK_ANDROID_TIME;
-+			stat->atime.tv_nsec = 0;
-+			stat->mtime.tv_sec = STOCK_ANDROID_TIME;
-+			stat->mtime.tv_nsec = 0;
-+			stat->ctime.tv_sec = STOCK_ANDROID_TIME;
-+			stat->ctime.tv_nsec = 0;
++			/* Copy timestamps from parent directory for consistency */
++			nomount_get_parent_timestamps(rule->virtual_path, stat);
 +			rcu_read_unlock();
 +			return;
 +		}
@@ -552,12 +642,8 @@ index 000000000..43ca3f0fa
 +	if (expected_dev != 0 && stat->dev != expected_dev) {
 +		stat->dev = expected_dev;
 +		stat->ino = full_name_hash(NULL, path, strlen(path));
-+		stat->atime.tv_sec = STOCK_ANDROID_TIME;
-+		stat->atime.tv_nsec = 0;
-+		stat->mtime.tv_sec = STOCK_ANDROID_TIME;
-+		stat->mtime.tv_nsec = 0;
-+		stat->ctime.tv_sec = STOCK_ANDROID_TIME;
-+		stat->ctime.tv_nsec = 0;
++		/* Copy timestamps from parent directory for consistency */
++		nomount_get_parent_timestamps(path, stat);
 +	}
 +}
 +EXPORT_SYMBOL(vfs_dcache_spoof_stat_dev);
@@ -1036,7 +1122,10 @@ index 000000000..43ca3f0fa
 +	hash_add_rcu(nomount_rules_ht, &rule->node, hash);
 +	list_add_tail(&rule->list, &nomount_rules_list);
 +	spin_unlock(&nomount_lock);
-+	
++
++	/* Mark parent directory for O(1) hide check optimization */
++	nomount_mark_parent_has_hidden(v_path);
++
 +	type = DT_REG; 
 +	if (data.flags & NM_FLAG_IS_DIR) type = DT_DIR;
 +
@@ -1570,6 +1659,7 @@ index 000000000..9e0fb1b21
 +int nomount_spoof_statfs(struct inode *inode, struct kstatfs *buf);
 +bool vfs_dcache_is_mount_hidden(int mount_id);
 +bool vfs_dcache_should_hide_map(const char *file_path);
++bool nomount_parent_has_hidden_fast(struct inode *dir_inode);
 +#else
 +static inline char *nomount_resolve_path(const char *p) { return NULL; }
 +static inline struct filename *nomount_getname_hook(struct filename *name) { return name; }
@@ -1584,6 +1674,7 @@ index 000000000..9e0fb1b21
 +static inline int nomount_spoof_statfs(struct inode *inode, struct kstatfs *buf) { return -EINVAL; }
 +static inline bool vfs_dcache_is_mount_hidden(int mount_id) { return false; }
 +static inline bool vfs_dcache_should_hide_map(const char *file_path) { return false; }
++static inline bool nomount_parent_has_hidden_fast(struct inode *dir_inode) { return false; }
 +#endif
 +
 +#endif /* _LINUX_VFS_DCACHE_H */
