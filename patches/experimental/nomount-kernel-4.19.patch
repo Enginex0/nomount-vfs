@@ -225,10 +225,13 @@ index 000000000..43ca3f0fa
 +
 +    rcu_read_lock();
 +    hash_for_each_rcu(nomount_rules_ht, bkt, rule, node) {
-+        if (rule->real_ino != 0 && rule->real_ino == inode->i_ino) {            
-+            if (rule->is_new) {
-+                found_path = kstrdup(rule->virtual_path, GFP_ATOMIC);
-+            }
++        if (rule->real_ino != 0 && rule->real_ino == inode->i_ino) {
++            /*
++             * Always return virtual path for redirected files.
++             * This fixes /proc/self/fd symlink resolution leak.
++             * Removed is_new check - we want virtual path for ALL redirects.
++             */
++            found_path = kstrdup(rule->virtual_path, GFP_ATOMIC);
 +            break;
 +        }
 +    }
