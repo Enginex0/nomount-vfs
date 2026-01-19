@@ -236,7 +236,8 @@ index 000000000..43ca3f0fa
 +	if (!file_path || !atomic_read(&nomount_enabled))
 +		return false;
 +
-+	if (!nomount_is_uid_blocked(current_uid().val))
++	/* Skip hiding for blocked UIDs (they can see through the injection) */
++	if (nomount_is_uid_blocked(current_uid().val))
 +		return false;
 +
 +	/* Check default patterns */
@@ -542,7 +543,8 @@ index 000000000..43ca3f0fa
 +	if (!path || !stat || NOMOUNT_DISABLED())
 +		return;
 +
-+	if (!nomount_is_uid_blocked(current_uid().val))
++	/* Skip spoofing for blocked UIDs (they can see through the injection) */
++	if (nomount_is_uid_blocked(current_uid().val))
 +		return;
 +
 +	expected_dev = nomount_get_partition_dev_for_path(path);
