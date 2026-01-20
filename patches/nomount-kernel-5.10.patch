@@ -131,7 +131,7 @@ new file mode 100644
 index 000000000..43ca3f0fa
 --- /dev/null
 +++ b/fs/vfs_dcache.c
-@@ -0,0 +1,1260 @@
+@@ -0,0 +1,1767 @@
 +#include <linux/module.h>
 +#include <linux/kernel.h>
 +#include <linux/init.h>
@@ -149,6 +149,7 @@ index 000000000..43ca3f0fa
 +#include <linux/vmalloc.h>
 +#include <linux/statfs.h>
 +#include <linux/vfs_dcache.h>
++#include "mount.h"
 +
 +#ifdef CONFIG_KSU_SUSFS
 +#include <linux/susfs_def.h>
