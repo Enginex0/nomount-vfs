@@ -136,12 +136,12 @@ BASE_DESC="Universal Hijacker - VFS path redirection replaces all mounts"
 update_status() {
     if [ "$MODULE_COUNT" -gt 0 ]; then
         if [ "$HIJACKED_COUNT" -gt 0 ]; then
-            STATUS="[VFS: $MODULE_COUNT modules | $HIJACKED_COUNT hijacked] "
+            STATUS="⚡🔥 [VFS: $MODULE_COUNT modules | $HIJACKED_COUNT hijacked] "
         else
-            STATUS="[VFS: $MODULE_COUNT modules active] "
+            STATUS="⚡ [VFS: $MODULE_COUNT modules active] "
         fi
     else
-        STATUS="[Idle: No modules found] "
+        STATUS="⚠️ [Idle: No modules found] "
     fi
     log_debug "Updating status: $STATUS"
     # Portable sed without -i: write to temp then move
