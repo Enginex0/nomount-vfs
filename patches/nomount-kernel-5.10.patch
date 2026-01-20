@@ -131,7 +131,7 @@ new file mode 100644
 index 000000000..43ca3f0fa
 --- /dev/null
 +++ b/fs/vfs_dcache.c
-@@ -0,0 +1,1767 @@
+@@ -0,0 +1,1778 @@
 +#include <linux/module.h>
 +#include <linux/kernel.h>
 +#include <linux/init.h>
@@ -172,7 +172,15 @@ index 000000000..43ca3f0fa
 +LIST_HEAD(nomount_rules_list);
 +DEFINE_SPINLOCK(nomount_lock);
 +
-+atomic_t nomount_enabled = ATOMIC_INIT(1);
++/* Per-CPU recursion guard to prevent infinite loops in VFS hooks */
++static DEFINE_PER_CPU(int, nomount_in_hook);
++#define NOMOUNT_HOOK_ENTER() \
++	do { if (this_cpu_read(nomount_in_hook)) return; this_cpu_inc(nomount_in_hook); } while(0)
++#define NOMOUNT_HOOK_ENTER_RET(ret) \
++	do { if (this_cpu_read(nomount_in_hook)) return (ret); this_cpu_inc(nomount_in_hook); } while(0)
++#define NOMOUNT_HOOK_EXIT() this_cpu_dec(nomount_in_hook)
++
++atomic_t nomount_enabled = ATOMIC_INIT(0);  /* DISABLED by default - enable via IOCTL after filesystems mounted */
 +EXPORT_SYMBOL(nomount_enabled);
 +#define NOMOUNT_DISABLED() (atomic_read(&nomount_enabled) == 0)
 +
@@ -352,60 +360,24 @@ index 000000000..43ca3f0fa
 +	return 0;
 +}
 +
++/*
++ * Set static timestamps for injected files.
++ * IMPORTANT: This function MUST NOT call kern_path() or vfs_getattr() as those
++ * can trigger the stat hook recursively, causing infinite recursion and deadlock.
++ * Using static timestamps (STOCK_ANDROID_TIME = 2009-01-01) is safe and matches
++ * what most stock Android system files have.
++ */
 +static void nomount_get_parent_timestamps(const char *path, struct kstat *stat)
 +{
-+	char *parent_path;
-+	char *last_slash;
-+	struct path parent;
-+	struct kstat parent_stat;
++	(void)path;  /* Unused - we always use static timestamps to prevent recursion */
 +
-+	if (!path || strlen(path) < 2)
-+		return;
-+
-+	parent_path = kstrdup(path, GFP_KERNEL);
-+	if (!parent_path)
-+		return;
-+
-+	last_slash = strrchr(parent_path, '/');
-+	if (last_slash && last_slash != parent_path) {
-+		*last_slash = '\0';
-+	} else {
-+		/* Root directory - use static time */
-+		kfree(parent_path);
-+		stat->atime.tv_sec = STOCK_ANDROID_TIME;
-+		stat->mtime.tv_sec = STOCK_ANDROID_TIME;
-+		stat->ctime.tv_sec = STOCK_ANDROID_TIME;
-+		stat->atime.tv_nsec = 0;
-+		stat->mtime.tv_nsec = 0;
-+		stat->ctime.tv_nsec = 0;
-+		return;
-+	}
-+
-+	if (kern_path(parent_path, LOOKUP_FOLLOW, &parent) == 0) {
-+		if (vfs_getattr(&parent, &parent_stat, STATX_BASIC_STATS, AT_STATX_SYNC_AS_STAT) == 0) {
-+			stat->atime = parent_stat.atime;
-+			stat->mtime = parent_stat.mtime;
-+			stat->ctime = parent_stat.ctime;
-+		} else {
-+			/* Fallback to static */
-+			stat->atime.tv_sec = STOCK_ANDROID_TIME;
-+			stat->mtime.tv_sec = STOCK_ANDROID_TIME;
-+			stat->ctime.tv_sec = STOCK_ANDROID_TIME;
-+			stat->atime.tv_nsec = 0;
-+			stat->mtime.tv_nsec = 0;
-+			stat->ctime.tv_nsec = 0;
-+		}
-+		path_put(&parent);
-+	} else {
-+		/* Fallback to static */
-+		stat->atime.tv_sec = STOCK_ANDROID_TIME;
-+		stat->mtime.tv_sec = STOCK_ANDROID_TIME;
-+		stat->ctime.tv_sec = STOCK_ANDROID_TIME;
-+		stat->atime.tv_nsec = 0;
-+		stat->mtime.tv_nsec = 0;
-+		stat->ctime.tv_nsec = 0;
-+	}
-+	kfree(parent_path);
++	/* Use static Android stock timestamps - safe, no VFS calls, no recursion */
++	stat->atime.tv_sec = STOCK_ANDROID_TIME;
++	stat->mtime.tv_sec = STOCK_ANDROID_TIME;
++	stat->ctime.tv_sec = STOCK_ANDROID_TIME;
++	stat->atime.tv_nsec = 0;
++	stat->mtime.tv_nsec = 0;
++	stat->ctime.tv_nsec = 0;
 +}
 +
 +bool nomount_match_path(const char *input_path, const char *rule_path) {
@@ -457,10 +429,17 @@ index 000000000..43ca3f0fa
 + * Called when a rule is added to capture device ID and statfs
 + * from the target partition BEFORE any overlays exist.
 + */
++/*
++ * Cache partition metadata from virtual path's mount point.
++ * IMPORTANT: This function is called during rule addition. If the path doesn't
++ * exist yet (partition not mounted), we return SUCCESS with zeroed cache.
++ * The spoof functions will use fallbacks in that case.
++ * This prevents boot deadlock if rules are added before filesystems are mounted.
++ */
 +static int nomount_cache_partition_metadata(struct nomount_rule *rule)
 +{
 +	struct path vpath, mnt_path;
-+	int ret = -ENOENT;
++	int ret;
 +
 +	NM_DBG("cache_metadata: ENTER vpath=%s\n", rule ? rule->virtual_path : "(null)");
 +
@@ -469,41 +448,53 @@ index 000000000..43ca3f0fa
 +		return -EINVAL;
 +	}
 +
-+	/* Resolve virtual path */
-+	if (kern_path(rule->virtual_path, LOOKUP_FOLLOW, &vpath) == 0) {
-+		/* Cache device ID from the resolved path's superblock */
-+		rule->cached_partition_dev = vpath.dentry->d_sb->s_dev;
-+		NM_DBG("cache_metadata: resolved dev=%u:%u for %s\n",
-+			MAJOR(rule->cached_partition_dev),
-+			MINOR(rule->cached_partition_dev),
-+			rule->virtual_path);
++	/* Initialize cache to zero - indicates "not cached yet" */
++	rule->cached_partition_dev = 0;
++	memset(&rule->cached_statfs, 0, sizeof(rule->cached_statfs));
 +
-+		/* Get mount root for statfs */
-+		mnt_path.mnt = vpath.mnt;
-+		mnt_path.dentry = vpath.mnt->mnt_root;
-+
-+		/* Cache statfs from the mount point */
-+		ret = vfs_statfs(&mnt_path, &rule->cached_statfs);
-+		if (ret != 0) {
-+			NM_ERR("cache_metadata: vfs_statfs FAILED for %s (ret=%d)\n",
-+				rule->virtual_path, ret);
-+		} else {
-+			NM_INFO("cache_metadata: SUCCESS vpath=%s dev=%u:%u f_type=0x%lx f_bsize=%ld\n",
-+				rule->virtual_path,
-+				MAJOR(rule->cached_partition_dev),
-+				MINOR(rule->cached_partition_dev),
-+				(unsigned long)rule->cached_statfs.f_type,
-+				rule->cached_statfs.f_bsize);
-+		}
-+
-+		path_put(&vpath);
-+	} else {
-+		NM_ERR("cache_metadata: kern_path FAILED for %s (path not found)\n",
-+			rule->virtual_path);
++	/* Try to resolve virtual path - may fail if partition not mounted yet */
++	ret = kern_path(rule->virtual_path, LOOKUP_FOLLOW, &vpath);
++	if (ret == -ENOENT || ret == -ENOTDIR) {
++		/* Path doesn't exist yet - this is OK, not an error */
++		/* The spoof functions will use fallbacks */
++		NM_INFO("cache_metadata: path %s not available yet (ret=%d), using fallbacks\n",
++			rule->virtual_path, ret);
++		return 0;  /* SUCCESS - rule can still function without cache */
++	}
++	if (ret != 0) {
++		NM_ERR("cache_metadata: kern_path failed for %s (ret=%d)\n",
++			rule->virtual_path, ret);
++		return 0;  /* Still return success - don't fail rule addition */
 +	}
 +
-+	NM_DBG("cache_metadata: EXIT ret=%d\n", ret);
-+	return ret;
++	/* Cache device ID from the resolved path's superblock */
++	rule->cached_partition_dev = vpath.dentry->d_sb->s_dev;
++	NM_DBG("cache_metadata: resolved dev=%u:%u for %s\n",
++		MAJOR(rule->cached_partition_dev),
++		MINOR(rule->cached_partition_dev),
++		rule->virtual_path);
++
++	/* Get mount root for statfs */
++	mnt_path.mnt = vpath.mnt;
++	mnt_path.dentry = vpath.mnt->mnt_root;
++
++	/* Cache statfs from the mount point */
++	ret = vfs_statfs(&mnt_path, &rule->cached_statfs);
++	if (ret != 0) {
++		NM_ERR("cache_metadata: vfs_statfs FAILED for %s (ret=%d)\n",
++			rule->virtual_path, ret);
++		/* Don't fail - device ID is still cached */
++	} else {
++		NM_INFO("cache_metadata: SUCCESS vpath=%s dev=%u:%u f_type=0x%lx f_bsize=%ld\n",
++			rule->virtual_path,
++			MAJOR(rule->cached_partition_dev),
++			MINOR(rule->cached_partition_dev),
++			(unsigned long)rule->cached_statfs.f_type,
++			rule->cached_statfs.f_bsize);
++	}
++
++	path_put(&vpath);
++	return 0;  /* Always return success - rule functions with or without cache */
 +}
 +
 +static unsigned long nomount_generate_ino(const char *dir, const char *name) {
@@ -519,6 +510,7 @@ index 000000000..43ca3f0fa
 +
 +	if (!inode || NOMOUNT_DISABLED()) return NULL;
 +	if (nomount_is_uid_blocked(current_uid().val)) return NULL;
++	NOMOUNT_HOOK_ENTER_RET(NULL);  /* Recursion guard */
 +
 +	NM_DBG("get_vpath: lookup ino=%lu dev=%u\n", inode->i_ino, inode->i_sb->s_dev);
 +
@@ -543,6 +535,7 @@ index 000000000..43ca3f0fa
 +		}
 +	}
 +	rcu_read_unlock();
++	NOMOUNT_HOOK_EXIT();  /* Recursion guard */
 +	return found_path;
 +}
 +EXPORT_SYMBOL(nomount_get_virtual_path_for_inode);
@@ -731,6 +724,8 @@ index 000000000..43ca3f0fa
 +	if (nomount_is_uid_blocked(current_uid().val))
 +		return;
 +
++	NOMOUNT_HOOK_ENTER();  /* Recursion guard - prevents stat->vfs_getattr->stat loop */
++
 +	NM_DBG("spoof_stat: checking ino=%lu dev=%u\n", inode->i_ino, inode->i_sb->s_dev);
 +
 +	if (nm_system_dev == 0)
@@ -778,6 +773,7 @@ index 000000000..43ca3f0fa
 +			stat->ctime.tv_nsec = 0;
 +		}
 +	}
++	NOMOUNT_HOOK_EXIT();  /* Recursion guard */
 +}
 +EXPORT_SYMBOL(nomount_spoof_stat);
 +
@@ -932,6 +928,8 @@ index 000000000..43ca3f0fa
 +		return -EINVAL;
 +	}
 +
++	NOMOUNT_HOOK_ENTER_RET(-ENODATA);  /* Recursion guard */
++
 +	if (nomount_is_uid_blocked(current_uid().val)) {
 +		NM_DBG("spoof_statfs: uid %u blocked\n", current_uid().val);
 +		return -EINVAL;
@@ -949,6 +947,7 @@ index 000000000..43ca3f0fa
 +					inode->i_ino, rule->virtual_path,
 +					(unsigned long)buf->f_type);
 +				rcu_read_unlock();
++				NOMOUNT_HOOK_EXIT();  /* Recursion guard */
 +				return 0;
 +			}
 +		}
@@ -967,12 +966,14 @@ index 000000000..43ca3f0fa
 +			NM_INFO("spoof_statfs: PREFIX FALLBACK -> f_type=0x%lx (from rule vpath=%s)\n",
 +				(unsigned long)buf->f_type, rule->virtual_path);
 +			rcu_read_unlock();
++			NOMOUNT_HOOK_EXIT();  /* Recursion guard */
 +			return 0;
 +		}
 +	}
 +	rcu_read_unlock();
 +
 +	NM_DBG("spoof_statfs: NO MATCH for ino=%lu\n", inode->i_ino);
++	NOMOUNT_HOOK_EXIT();  /* Recursion guard */
 +	return -ENODATA;
 +}
 +EXPORT_SYMBOL(nomount_spoof_statfs);
@@ -1869,6 +1870,14 @@ index 000000000..43ca3f0fa
 +	case NOMOUNT_IOC_CLEAR_MAPS_PATTERNS:
 +		NM_INFO("ioctl: CLEAR_MAPS_PATTERNS\n");
 +		return nomount_ioctl_clear_maps_patterns();
++	case NOMOUNT_IOC_ENABLE:
++		NM_INFO("ioctl: ENABLE - activating NoMount hooks\n");
++		atomic_set(&nomount_enabled, 1);
++		return 0;
++	case NOMOUNT_IOC_DISABLE:
++		NM_INFO("ioctl: DISABLE - deactivating NoMount hooks\n");
++		atomic_set(&nomount_enabled, 0);
++		return 0;
 +	default:
 +		NM_ERR("ioctl: unknown command 0x%x\n", cmd);
 +		return -EINVAL;
@@ -1906,7 +1915,7 @@ new file mode 100644
 index 000000000..9e0fb1b21
 --- /dev/null
 +++ b/include/linux/vfs_dcache.h
-@@ -0,0 +1,191 @@
+@@ -0,0 +1,194 @@
 +#ifndef _LINUX_VFS_DCACHE_H
 +#define _LINUX_VFS_DCACHE_H
 +
@@ -1975,6 +1984,9 @@ index 000000000..9e0fb1b21
 +#define NOMOUNT_IOC_ADD_MAPS_PATTERN    _IOW(NOMOUNT_IOC_MAGIC, 0x30, char *)
 +#define NOMOUNT_IOC_DEL_MAPS_PATTERN    _IOW(NOMOUNT_IOC_MAGIC, 0x31, char *)
 +#define NOMOUNT_IOC_CLEAR_MAPS_PATTERNS _IO(NOMOUNT_IOC_MAGIC, 0x32)
++/* Module enable/disable - module starts DISABLED to prevent early boot deadlock */
++#define NOMOUNT_IOC_ENABLE              _IO(NOMOUNT_IOC_MAGIC, 0x40)
++#define NOMOUNT_IOC_DISABLE             _IO(NOMOUNT_IOC_MAGIC, 0x41)
 +#define MAX_LIST_BUFFER_SIZE (64 * 1024)
 +
 +struct nomount_ioctl_data {
