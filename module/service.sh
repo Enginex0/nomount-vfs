@@ -898,6 +898,16 @@ log_info "========== SUSFS-INDEPENDENT VFS HIDING =========="
 cache_partition_devs
 register_hidden_mounts
 register_maps_patterns
+
+# Enable NoMount hooks NOW - after partition cache is ready, before VFS rules
+# Module starts DISABLED to prevent early boot deadlock (kern_path on unmounted partitions)
+log_info "Enabling NoMount VFS hooks..."
+if "$LOADER" enable < /dev/null 2>/dev/null; then
+    log_info "NoMount hooks ENABLED - VFS interception active"
+else
+    log_err "FATAL: Failed to enable NoMount hooks!"
+    exit 1
+fi
 log_info ""
 
 if [ "$universal_hijack" = "true" ]; then
