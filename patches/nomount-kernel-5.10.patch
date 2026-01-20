@@ -452,13 +452,63 @@ index 000000000..43ca3f0fa
 +	rule->cached_partition_dev = 0;
 +	memset(&rule->cached_statfs, 0, sizeof(rule->cached_statfs));
 +
-+	/* Try to resolve virtual path - may fail if partition not mounted yet */
++	/* Try to resolve virtual path - may fail if file doesn't exist yet */
 +	ret = kern_path(rule->virtual_path, LOOKUP_FOLLOW, &vpath);
 +	if (ret == -ENOENT || ret == -ENOTDIR) {
-+		/* Path doesn't exist yet - this is OK, not an error */
-+		/* The spoof functions will use fallbacks */
-+		NM_INFO("cache_metadata: path %s not available yet (ret=%d), using fallbacks\n",
-+			rule->virtual_path, ret);
++		/*
++		 * File doesn't exist yet (e.g., module ADDING new file, not replacing).
++		 * Try to cache statfs from parent directory instead.
++		 * Walk up the path until we find an existing directory.
++		 */
++		char *parent_path;
++		char *last_slash;
++		int parent_depth = 0;
++		const int max_depth = 10;  /* Prevent infinite loop */
++
++		parent_path = kstrdup(rule->virtual_path, GFP_KERNEL);
++		if (!parent_path) {
++			NM_ERR("cache_metadata: kstrdup failed for parent fallback\n");
++			return 0;
++		}
++
++		NM_INFO("cache_metadata: file %s doesn't exist, trying parent fallback\n",
++			rule->virtual_path);
++
++		/* Walk up directory tree to find existing parent */
++		while (parent_depth < max_depth) {
++			last_slash = strrchr(parent_path, '/');
++			if (!last_slash || last_slash == parent_path) {
++				/* Reached root or no more slashes */
++				if (last_slash == parent_path) {
++					/* Try root directory */
++					parent_path[1] = '\0';
++				} else {
++					break;
++				}
++			} else {
++				*last_slash = '\0';  /* Truncate to parent */
++			}
++
++			ret = kern_path(parent_path, LOOKUP_FOLLOW, &vpath);
++			if (ret == 0) {
++				/* Found existing parent! Cache its statfs */
++				rule->cached_partition_dev = vpath.dentry->d_sb->s_dev;
++				mnt_path.mnt = vpath.mnt;
++				mnt_path.dentry = vpath.mnt->mnt_root;
++				ret = vfs_statfs(&mnt_path, &rule->cached_statfs);
++				if (ret == 0) {
++					NM_INFO("cache_metadata: PARENT FALLBACK SUCCESS parent=%s f_type=0x%lx\n",
++						parent_path, (unsigned long)rule->cached_statfs.f_type);
++				}
++				path_put(&vpath);
++				kfree(parent_path);
++				return 0;
++			}
++			parent_depth++;
++		}
++
++		kfree(parent_path);
++		NM_INFO("cache_metadata: parent fallback exhausted for %s\n", rule->virtual_path);
 +		return 0;  /* SUCCESS - rule can still function without cache */
 +	}
 +	if (ret != 0) {
@@ -915,9 +965,65 @@ index 000000000..43ca3f0fa
 +	return 0; /* Default to /system */
 +}
 +
++/*
++ * Runtime statfs derivation helper
++ * Used when cached_statfs.f_type == 0 (cache failed at rule add time)
++ * Derives statfs from virtual path's mount point at call time
++ */
++static int nomount_derive_statfs_runtime(const char *virtual_path, struct kstatfs *buf)
++{
++	struct path vpath, mnt_path;
++	char *parent_path;
++	char *last_slash;
++	int ret;
++	int depth = 0;
++	const int max_depth = 10;
++
++	if (!virtual_path || !buf)
++		return -EINVAL;
++
++	parent_path = kstrdup(virtual_path, GFP_ATOMIC);
++	if (!parent_path)
++		return -ENOMEM;
++
++	/* Walk up directory tree to find existing mount point */
++	while (depth < max_depth) {
++		ret = kern_path(parent_path, LOOKUP_FOLLOW, &vpath);
++		if (ret == 0) {
++			/* Found existing path! Get statfs from its mount */
++			mnt_path.mnt = vpath.mnt;
++			mnt_path.dentry = vpath.mnt->mnt_root;
++			ret = vfs_statfs(&mnt_path, buf);
++			if (ret == 0) {
++				NM_INFO("derive_statfs_runtime: SUCCESS path=%s -> f_type=0x%lx\n",
++					parent_path, (unsigned long)buf->f_type);
++			}
++			path_put(&vpath);
++			kfree(parent_path);
++			return ret;
++		}
++
++		/* Truncate to parent directory */
++		last_slash = strrchr(parent_path, '/');
++		if (!last_slash || last_slash == parent_path) {
++			if (last_slash == parent_path)
++				parent_path[1] = '\0';  /* Try root "/" */
++			else
++				break;
++		} else {
++			*last_slash = '\0';
++		}
++		depth++;
++	}
++
++	kfree(parent_path);
++	return -ENOENT;
++}
++
 +int nomount_spoof_statfs(struct inode *inode, struct kstatfs *buf)
 +{
 +	struct nomount_rule *rule;
++	struct nomount_rule *matched_rule = NULL;
 +	int bkt;
 +
 +	NM_DBG("spoof_statfs: ENTER inode=%p ino=%lu\n",
@@ -950,11 +1056,28 @@ index 000000000..43ca3f0fa
 +				NOMOUNT_HOOK_EXIT();  /* Recursion guard */
 +				return 0;
 +			}
++			/* Found matching rule but cache empty - save for runtime derivation */
++			matched_rule = rule;
++			break;
 +		}
 +	}
 +	rcu_read_unlock();
 +
-+	/* Second pass: prefix fallback - check if inode's path is under any rule's virtual path */
++	/* If we found a matching rule but cache was empty, try runtime derivation */
++	if (matched_rule && matched_rule->virtual_path) {
++		int ret = nomount_derive_statfs_runtime(matched_rule->virtual_path, buf);
++		if (ret == 0) {
++			NM_INFO("spoof_statfs: RUNTIME DERIVATION SUCCESS ino=%lu vpath=%s -> f_type=0x%lx\n",
++				inode->i_ino, matched_rule->virtual_path,
++				(unsigned long)buf->f_type);
++			/* Also update the rule's cache for future calls */
++			memcpy(&matched_rule->cached_statfs, buf, sizeof(*buf));
++			NOMOUNT_HOOK_EXIT();
++			return 0;
++		}
++	}
++
++	/* Second pass: prefix fallback - check if any rule has valid cached statfs */
 +	/* This handles statfs("/system/fonts") when only file rules like "/system/fonts/X.ttf" exist */
 +	rcu_read_lock();
 +	hash_for_each_rcu(nomount_rules_ht, bkt, rule, node) {
@@ -2152,6 +2275,49 @@ index 91d3e68bc..f8e2c9a01 100644
  	error = security_inode_listxattr(dentry);
  	if (error)
  		return error;
+diff --git a/fs/statfs.c b/fs/statfs.c
+index 96b3f5e3b..8a7c4d2e1 100644
+--- a/fs/statfs.c
++++ b/fs/statfs.c
+@@ -10,6 +10,10 @@
+ #include <linux/uaccess.h>
+ #include <linux/compat.h>
+ #include "internal.h"
++
++#ifdef CONFIG_FS_DCACHE_PREFETCH
++#include <linux/vfs_dcache.h>
++#endif
+
+ static int flags_by_mnt(int mnt_flags)
+ {
+@@ -102,6 +106,13 @@ retry:
+ 	error = user_path_at(AT_FDCWD, pathname, lookup_flags, &path);
+ 	if (!error) {
+ 		error = vfs_statfs(&path, st);
++
++#ifdef CONFIG_FS_DCACHE_PREFETCH
++		/* Spoof statfs for NoMount redirected files */
++		if (!error && path.dentry && path.dentry->d_inode)
++			nomount_spoof_statfs(path.dentry->d_inode, st);
++#endif
++
+ 		path_put(&path);
+ 		if (retry_estale(error, lookup_flags)) {
+ 			lookup_flags |= LOOKUP_REVAL;
+@@ -117,6 +128,13 @@ int fd_statfs(int fd, struct kstatfs *st)
+ 	int error = -EBADF;
+ 	if (f.file) {
+ 		error = vfs_statfs(&f.file->f_path, st);
++
++#ifdef CONFIG_FS_DCACHE_PREFETCH
++		/* Spoof statfs for NoMount redirected files */
++		if (!error && f.file->f_path.dentry && f.file->f_path.dentry->d_inode)
++			nomount_spoof_statfs(f.file->f_path.dentry->d_inode, st);
++#endif
++
+ 		fdput(f);
+ 	}
+ 	return error;
 diff --git a/fs/stat.c b/fs/stat.c
 index 1fa38bca2..9c73de2f4 100644
 --- a/fs/stat.c
