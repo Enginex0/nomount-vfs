@@ -9,16 +9,33 @@ MODDIR=${0%/*}
 MODULES_DIR="/data/adb/modules"
 
 # ============================================================
+# FUNCTION: Detect device architecture
+# Returns: arm64, arm, x86_64, or x86
+# ============================================================
+get_arch() {
+    local abi=$(getprop ro.product.cpu.abi)
+    case "$abi" in
+        arm64*) echo "arm64" ;;
+        armeabi*|arm*) echo "arm" ;;
+        x86_64*) echo "x86_64" ;;
+        x86*) echo "x86" ;;
+        *) echo "arm64" ;;  # Default fallback
+    esac
+}
+
+# ============================================================
 # FUNCTION: Find nm binary dynamically
 # Checks multiple possible locations for flexibility
+# Supports both arm64 and arm32 architectures
 # ============================================================
 find_nm_binary() {
+    local arch=$(get_arch)
     local possible_paths="
         $MODDIR/bin/nm
-        $MODDIR/nm-arm64
+        $MODDIR/nm-$arch
         $MODDIR/nm
         /data/adb/modules/nomount/bin/nm
-        /data/adb/modules/nomount/nm-arm64
+        /data/adb/modules/nomount/nm-$arch
         /data/adb/modules/nomount/nm
     "
     for path in $possible_paths; do
