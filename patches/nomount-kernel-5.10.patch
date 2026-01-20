@@ -131,7 +131,7 @@ new file mode 100644
 index 000000000..43ca3f0fa
 --- /dev/null
 +++ b/fs/vfs_dcache.c
-@@ -0,0 +1,1636 @@
+@@ -0,0 +1,1260 @@
 +#include <linux/module.h>
 +#include <linux/kernel.h>
 +#include <linux/init.h>
@@ -243,9 +243,20 @@ index 000000000..43ca3f0fa
 +
 +bool nomount_parent_has_hidden_fast(struct inode *dir_inode)
 +{
-+	if (!dir_inode || !dir_inode->i_mapping)
++	bool result;
++
++	if (!dir_inode || !dir_inode->i_mapping) {
++		NM_DBG("parent_has_hidden: null inode/mapping\n");
 +		return false;
-+	return test_bit(AS_NOMOUNT_HAS_HIDDEN, &dir_inode->i_mapping->flags);
++	}
++
++	result = test_bit(AS_NOMOUNT_HAS_HIDDEN, &dir_inode->i_mapping->flags);
++
++	if (result) {
++		NM_DBG("parent_has_hidden: ino=%lu HAS hidden children\n", dir_inode->i_ino);
++	}
++
++	return result;
 +}
 +EXPORT_SYMBOL(nomount_parent_has_hidden_fast);
 +
@@ -280,14 +291,18 @@ index 000000000..43ca3f0fa
 +	int i;
 +	int bkt;
 +
-+	if (!file_path || !atomic_read(&nomount_enabled))
++	NM_DBG("should_hide_map: ENTER path=%s\n", file_path ? file_path : "(null)");
++
++	if (!file_path || !atomic_read(&nomount_enabled)) {
++		NM_DBG("should_hide_map: early exit (null path or disabled)\n");
 +		return false;
++	}
 +
 +	/* Skip hiding for blocked UIDs (they can see through the injection) */
-+	if (nomount_is_uid_blocked(current_uid().val))
++	if (nomount_is_uid_blocked(current_uid().val)) {
++		NM_DBG("should_hide_map: uid %u blocked, not hiding\n", current_uid().val);
 +		return false;
-+
-+	NM_DBG("hide_map: checking %s\n", file_path);
++	}
 +
 +	/* Check default patterns */
 +	for (i = 0; nm_default_maps_patterns[i] != NULL; i++) {
@@ -434,6 +449,60 @@ index 000000000..43ca3f0fa
 +		d_invalidate(path.dentry);
 +		path_put(&path);
 +	}
++}
++
++/*
++ * Cache partition metadata from virtual path's mount point.
++ * Called when a rule is added to capture device ID and statfs
++ * from the target partition BEFORE any overlays exist.
++ */
++static int nomount_cache_partition_metadata(struct nomount_rule *rule)
++{
++	struct path vpath, mnt_path;
++	int ret = -ENOENT;
++
++	NM_DBG("cache_metadata: ENTER vpath=%s\n", rule ? rule->virtual_path : "(null)");
++
++	if (!rule || !rule->virtual_path) {
++		NM_ERR("cache_metadata: invalid rule or null virtual_path\n");
++		return -EINVAL;
++	}
++
++	/* Resolve virtual path */
++	if (kern_path(rule->virtual_path, LOOKUP_FOLLOW, &vpath) == 0) {
++		/* Cache device ID from the resolved path's superblock */
++		rule->cached_partition_dev = vpath.dentry->d_sb->s_dev;
++		NM_DBG("cache_metadata: resolved dev=%u:%u for %s\n",
++			MAJOR(rule->cached_partition_dev),
++			MINOR(rule->cached_partition_dev),
++			rule->virtual_path);
++
++		/* Get mount root for statfs */
++		mnt_path.mnt = vpath.mnt;
++		mnt_path.dentry = vpath.mnt->mnt_root;
++
++		/* Cache statfs from the mount point */
++		ret = vfs_statfs(&mnt_path, &rule->cached_statfs);
++		if (ret != 0) {
++			NM_ERR("cache_metadata: vfs_statfs FAILED for %s (ret=%d)\n",
++				rule->virtual_path, ret);
++		} else {
++			NM_INFO("cache_metadata: SUCCESS vpath=%s dev=%u:%u f_type=0x%lx f_bsize=%ld\n",
++				rule->virtual_path,
++				MAJOR(rule->cached_partition_dev),
++				MINOR(rule->cached_partition_dev),
++				(unsigned long)rule->cached_statfs.f_type,
++				rule->cached_statfs.f_bsize);
++		}
++
++		path_put(&vpath);
++	} else {
++		NM_ERR("cache_metadata: kern_path FAILED for %s (path not found)\n",
++			rule->virtual_path);
++	}
++
++	NM_DBG("cache_metadata: EXIT ret=%d\n", ret);
++	return ret;
 +}
 +
 +static unsigned long nomount_generate_ino(const char *dir, const char *name) {
@@ -595,14 +664,27 @@ index 000000000..43ca3f0fa
 +}
 +
 +bool nomount_is_traversal_allowed(struct inode *inode, int mask) {
-+	if (!inode || NOMOUNT_DISABLED() || nomount_is_uid_blocked(current_uid().val)) return false;
-+	if (!(mask & MAY_EXEC)) return false;
++	NM_DBG("is_traversal: ENTER inode=%p ino=%lu mask=0x%x\n",
++		inode, inode ? inode->i_ino : 0, mask);
++
++	if (!inode || NOMOUNT_DISABLED() || nomount_is_uid_blocked(current_uid().val)) {
++		NM_DBG("is_traversal: early exit (null/disabled/uid_blocked)\n");
++		return false;
++	}
++
++	if (!(mask & MAY_EXEC)) {
++		NM_DBG("is_traversal: not MAY_EXEC mask, returning false\n");
++		return false;
++	}
 +
 +	if ((nm_ino_adb != 0 && inode->i_ino == nm_ino_adb) ||
 +		(nm_ino_modules != 0 && inode->i_ino == nm_ino_modules)) {
-+		NM_DBG("is_traversal_allowed: allowing traversal for ino=%lu\n", inode->i_ino);
++		NM_INFO("is_traversal: ALLOWED for ino=%lu (adb=%lu modules=%lu)\n",
++			inode->i_ino, nm_ino_adb, nm_ino_modules);
 +		return true;
 +	}
++
++	NM_DBG("is_traversal: not matching adb/modules inodes, returning false\n");
 +	return false;
 +}
 +EXPORT_SYMBOL(nomount_is_traversal_allowed);
@@ -661,7 +743,10 @@ index 000000000..43ca3f0fa
 +		    rule->real_dev == inode->i_sb->s_dev) {
 +			/* Copy data we need before exiting RCU */
 +			vpath_copy = kstrdup(rule->virtual_path, GFP_ATOMIC);
-+			matched_dev = nomount_get_partition_dev(rule->virtual_path);
++			matched_dev = rule->cached_partition_dev;
++			/* Fallback to hardcoded lookup if cache not populated */
++			if (matched_dev == 0)
++				matched_dev = nomount_get_partition_dev(rule->virtual_path);
 +			matched_vino = rule->virtual_ino;
 +			found = true;
 +			NM_DBG("spoof_stat: matched rule vpath=%s\n", rule->virtual_path);
@@ -735,11 +820,18 @@ index 000000000..43ca3f0fa
 +	const char *context = NULL;
 +	int bkt;
 +
-+	if (!inode || NOMOUNT_DISABLED())
-+		return NULL;
++	NM_DBG("get_selinux_ctx: ENTER inode=%p ino=%lu\n",
++		inode, inode ? inode->i_ino : 0);
 +
-+	if (nomount_is_uid_blocked(current_uid().val))
++	if (!inode || NOMOUNT_DISABLED()) {
++		NM_DBG("get_selinux_ctx: early exit (null inode or disabled)\n");
 +		return NULL;
++	}
++
++	if (nomount_is_uid_blocked(current_uid().val)) {
++		NM_DBG("get_selinux_ctx: uid %u blocked\n", current_uid().val);
++		return NULL;
++	}
 +
 +	rcu_read_lock();
 +	hash_for_each_rcu(nomount_rules_ht, bkt, rule, node) {
@@ -759,10 +851,18 @@ index 000000000..43ca3f0fa
 +				context = "u:object_r:system_file:s0";
 +			else
 +				context = "u:object_r:system_file:s0";
++
++			NM_INFO("get_selinux_ctx: ino=%lu vpath=%s -> ctx=%s\n",
++				inode->i_ino, rule->virtual_path, context);
 +			break;
 +		}
 +	}
 +	rcu_read_unlock();
++
++	if (!context) {
++		NM_DBG("get_selinux_ctx: no match for ino=%lu\n", inode->i_ino);
++	}
++
 +	return context;
 +}
 +EXPORT_SYMBOL(nomount_get_spoofed_selinux_context);
@@ -822,30 +922,57 @@ index 000000000..43ca3f0fa
 +{
 +	struct nomount_rule *rule;
 +	int bkt;
-+	int idx;
 +
-+	if (!inode || !buf || NOMOUNT_DISABLED())
++	NM_DBG("spoof_statfs: ENTER inode=%p ino=%lu\n",
++		inode, inode ? inode->i_ino : 0);
++
++	if (!inode || !buf || NOMOUNT_DISABLED()) {
++		NM_DBG("spoof_statfs: early exit (null/disabled)\n");
 +		return -EINVAL;
++	}
 +
-+	if (nomount_is_uid_blocked(current_uid().val))
++	if (nomount_is_uid_blocked(current_uid().val)) {
++		NM_DBG("spoof_statfs: uid %u blocked\n", current_uid().val);
 +		return -EINVAL;
++	}
 +
-+	if (!nm_statfs_initialized)
-+		nomount_init_partition_statfs();
-+
++	/* First pass: exact inode match */
 +	rcu_read_lock();
 +	hash_for_each_rcu(nomount_rules_ht, bkt, rule, node) {
-+		/* Check both inode AND device to avoid cross-filesystem collision */
 +		if (rule->real_ino != 0 && rule->real_ino == inode->i_ino &&
 +		    rule->real_dev == inode->i_sb->s_dev) {
-+			idx = nomount_get_partition_index(rule->virtual_path);
-+			memcpy(buf, &nm_cached_statfs[idx], sizeof(*buf));
++			/* Use per-rule cached statfs - DYNAMIC, no hardcoded arrays */
++			if (rule->cached_statfs.f_type != 0) {
++				memcpy(buf, &rule->cached_statfs, sizeof(*buf));
++				NM_INFO("spoof_statfs: EXACT MATCH ino=%lu vpath=%s -> f_type=0x%lx\n",
++					inode->i_ino, rule->virtual_path,
++					(unsigned long)buf->f_type);
++				rcu_read_unlock();
++				return 0;
++			}
++		}
++	}
++	rcu_read_unlock();
++
++	/* Second pass: prefix fallback - check if inode's path is under any rule's virtual path */
++	/* This handles statfs("/system/fonts") when only file rules like "/system/fonts/X.ttf" exist */
++	rcu_read_lock();
++	hash_for_each_rcu(nomount_rules_ht, bkt, rule, node) {
++		if (rule->cached_statfs.f_type != 0) {
++			/* We have cached statfs - this rule's partition metadata is valid */
++			/* For prefix matching, we return first valid cached statfs */
++			/* since all rules under same partition share same statfs */
++			memcpy(buf, &rule->cached_statfs, sizeof(*buf));
++			NM_INFO("spoof_statfs: PREFIX FALLBACK -> f_type=0x%lx (from rule vpath=%s)\n",
++				(unsigned long)buf->f_type, rule->virtual_path);
 +			rcu_read_unlock();
 +			return 0;
 +		}
 +	}
 +	rcu_read_unlock();
-+	return -ENODATA;  /* Use ENODATA instead of EINVAL to avoid info leakage */
++
++	NM_DBG("spoof_statfs: NO MATCH for ino=%lu\n", inode->i_ino);
++	return -ENODATA;
 +}
 +EXPORT_SYMBOL(nomount_spoof_statfs);
 +
@@ -1234,6 +1361,9 @@ index 000000000..43ca3f0fa
 +
 +	rule->virtual_ino = full_name_hash(NULL, v_path, strlen(v_path));
 +	NM_DBG("add_rule: virtual_ino=%lu hash=%u\n", rule->virtual_ino, hash);
++
++	/* Cache partition metadata from virtual path for statfs spoofing */
++	nomount_cache_partition_metadata(rule);
 +
 +	spin_lock(&nomount_lock);
 +	hash_add_rcu(nomount_rules_ht, &rule->node, hash);
@@ -1773,7 +1903,7 @@ new file mode 100644
 index 000000000..9e0fb1b21
 --- /dev/null
 +++ b/include/linux/vfs_dcache.h
-@@ -0,0 +1,188 @@
+@@ -0,0 +1,186 @@
 +#ifndef _LINUX_VFS_DCACHE_H
 +#define _LINUX_VFS_DCACHE_H
 +
@@ -1865,6 +1995,8 @@ index 000000000..9e0fb1b21
 +	unsigned long real_ino;
 +	dev_t real_dev;
 +	unsigned long virtual_ino;
++	dev_t cached_partition_dev;       /* Cached device ID from virtual path's mount */
++	struct kstatfs cached_statfs;     /* Cached statfs from virtual path's mount */
 +	bool is_new;
 +	u32 flags;
 +	struct rcu_head rcu;
