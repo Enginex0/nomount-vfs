@@ -111,7 +111,10 @@ in_fd_statfs && /^static |^SYSCALL_DEFINE|^int / && !/fd_statfs/ {
 
 END {
     if (added_user_hook) print "# user_statfs hook added" > "/dev/stderr"
+    else print "WARNING: Could not hook user_statfs" > "/dev/stderr"
     if (added_fd_hook) print "# fd_statfs hook added" > "/dev/stderr"
+    else print "WARNING: Could not hook fd_statfs" > "/dev/stderr"
+    if (!added_user_hook || !added_fd_hook) exit 1
 }
 ' "$STATFS_FILE" > "${STATFS_FILE}.new"
 
