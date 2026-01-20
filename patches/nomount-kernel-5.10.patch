@@ -875,7 +875,7 @@ index 000000000..43ca3f0fa
 +static struct kstatfs nm_cached_statfs[17];
 +static bool nm_statfs_initialized = false;
 +
-+static void nomount_init_partition_statfs(void)
++static void __maybe_unused nomount_init_partition_statfs(void)
 +{
 +	struct path path;
 +	static const char *partitions[] = {
@@ -898,7 +898,7 @@ index 000000000..43ca3f0fa
 +	nm_statfs_initialized = true;
 +}
 +
-+static int nomount_get_partition_index(const char *virtual_path)
++static int __maybe_unused nomount_get_partition_index(const char *virtual_path)
 +{
 +	if (!virtual_path)
 +		return 0;
