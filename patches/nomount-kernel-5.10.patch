@@ -1143,6 +1143,7 @@ index 000000000..43ca3f0fa
 +
 +	__putname(page_buf);
 +}
++EXPORT_SYMBOL(nomount_inject_dents64);
 +
 +void nomount_inject_dents(struct file *file, void __user **dirent, int *count, loff_t *pos)
 +{
@@ -1198,6 +1199,7 @@ index 000000000..43ca3f0fa
 +
 +	__putname(page_buf);
 +}
++EXPORT_SYMBOL(nomount_inject_dents);
 +
 +/*
 + * Recursively inject directory entries up the path tree
