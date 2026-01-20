@@ -131,7 +131,7 @@ new file mode 100644
 index 000000000..43ca3f0fa
 --- /dev/null
 +++ b/fs/vfs_dcache.c
-@@ -0,0 +1,1919 @@
+@@ -0,0 +1,1939 @@
 +#include <linux/module.h>
 +#include <linux/kernel.h>
 +#include <linux/init.h>
@@ -1510,6 +1510,29 @@ index 000000000..43ca3f0fa
 +	/* Cache partition metadata from virtual path for statfs spoofing */
 +	nomount_cache_partition_metadata(rule);
 +
++	/* Check for duplicate virtual_path before adding */
++	{
++		struct nomount_rule *existing;
++		bool duplicate = false;
++
++		rcu_read_lock();
++		hash_for_each_possible_rcu(nomount_rules_ht, existing, node, hash) {
++			if (strcmp(existing->virtual_path, v_path) == 0) {
++				duplicate = true;
++				break;
++			}
++		}
++		rcu_read_unlock();
++
++		if (duplicate) {
++			NM_DBG("add_rule: duplicate vpath=%s, skipping\n", v_path);
++			kfree(v_path);
++			kfree(r_path);
++			kfree(rule);
++			return 0;  /* Not an error, just skip duplicate */
++		}
++	}
++
 +	spin_lock(&nomount_lock);
 +	hash_add_rcu(nomount_rules_ht, &rule->node, hash);
 +	list_add_tail(&rule->list, &nomount_rules_list);
@@ -2257,9 +2280,9 @@ index 91d3e68bc..f8e2c9a01 100644
 --- a/fs/xattr.c
 +++ b/fs/xattr.c
 @@ -23,6 +23,10 @@
-
+ 
  #include <linux/uaccess.h>
-
+ 
 +#ifdef CONFIG_FS_DCACHE_PREFETCH
 +#include <linux/vfs_dcache.h>
 +#endif
@@ -2271,7 +2294,7 @@ index 91d3e68bc..f8e2c9a01 100644
  {
  	struct inode *inode = d_inode(dentry);
  	ssize_t error;
-
+ 
 +#ifdef CONFIG_FS_DCACHE_PREFETCH
 +	/* Spoof xattr list for injected files - return only security.selinux */
 +	if (nomount_is_injected_file(inode)) {
@@ -2305,7 +2328,7 @@ index 96b3f5e3b..8a7c4d2e1 100644
 +#ifdef CONFIG_FS_DCACHE_PREFETCH
 +#include <linux/vfs_dcache.h>
 +#endif
-
+ 
  static int flags_by_mnt(int mnt_flags)
  {
 @@ -102,6 +106,13 @@ retry:
@@ -2343,7 +2366,7 @@ index 1fa38bca2..9c73de2f4 100644
 @@ -18,6 +18,10 @@
  #include <linux/uaccess.h>
  #include <asm/unaligned.h>
-
+ 
 +#ifdef CONFIG_FS_DCACHE_PREFETCH
 +#include <linux/vfs_dcache.h>
 +#endif
@@ -2364,3 +2387,41 @@ index 1fa38bca2..9c73de2f4 100644
  	stat->mode = inode->i_mode;
  	stat->nlink = inode->i_nlink;
  	stat->uid = inode->i_uid;
+@@ -56,6 +66,8 @@ EXPORT_SYMBOL(generic_fillattr);
+ int vfs_getattr_nosec(const struct path *path, struct kstat *stat,
+ 		      u32 request_mask, unsigned int query_flags)
+ {
++	int retval;
++
+ 	struct inode *inode = d_backing_inode(path->dentry);
+ 
+ 	memset(stat, 0, sizeof(*stat));
+@@ -73,10 +85,24 @@ int vfs_getattr_nosec(const struct path *path, struct kstat *stat,
+ 		stat->attributes |= STATX_ATTR_DAX;
+ 
+ 	if (inode->i_op->getattr)
+-		return inode->i_op->getattr(path, stat, request_mask,
+-					    query_flags);
++		retval = inode->i_op->getattr(path, stat, request_mask,
++					      query_flags);
++	else {
++		generic_fillattr(inode, stat);
++		retval = 0;
++	}
+ 
+-	generic_fillattr(inode, stat);
+-	return 0;
++#ifdef CONFIG_FS_DCACHE_PREFETCH
++	{
++		char *__nm_buf = (char *)__get_free_page(GFP_KERNEL);
++		if (__nm_buf) {
++			char *__nm_path = d_path(path, __nm_buf, PAGE_SIZE);
++			if (!IS_ERR(__nm_path))
++				vfs_dcache_spoof_stat_dev(__nm_path, stat);
++			free_page((unsigned long)__nm_buf);
++		}
++	}
++#endif
++	return retval;
+ }
+ EXPORT_SYMBOL(vfs_getattr_nosec);

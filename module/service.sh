@@ -66,6 +66,9 @@ FAILED_COUNT=0
 VFS_REGISTERED_COUNT=0
 START_TIME=$(date +%s)
 
+# Track processed modules to avoid double registration in universal_hijack mode
+PROCESSED_MODULES=""
+
 # Ensure data directory exists before any writes
 mkdir -p "$NOMOUNT_DATA" 2>/dev/null
 chmod 755 "$NOMOUNT_DATA" 2>/dev/null
@@ -543,9 +546,13 @@ register_module_vfs() {
     mkdir -p "$tracking_dir"
     : > "$tracking_file"
 
+    # Cache existing VFS rules to avoid duplicates (one-time snapshot for efficiency)
+    local existing_rules_file="$NOMOUNT_DATA/.existing_rules_$$"
+    "$LOADER" list 2>/dev/null | sed 's/.*->//' > "$existing_rules_file" || : > "$existing_rules_file"
+
     # Use temp file to accumulate counts (avoids subshell variable isolation from pipe)
     local count_file="$NOMOUNT_DATA/.vfs_count_$$"
-    echo "0 0 0" > "$count_file"  # file_count success_count whiteout_count
+    echo "0 0 0 0" > "$count_file"  # file_count success_count whiteout_count skip_count
 
     for partition in $TARGET_PARTITIONS; do
         if [ -d "$mod_path/$partition" ]; then
@@ -556,8 +563,17 @@ register_module_vfs() {
                 virtual_path="${real_path#$mod_path}"
 
                 # Read current counts
-                read f_cnt s_cnt w_cnt < "$count_file"
+                read f_cnt s_cnt w_cnt skip_cnt < "$count_file"
                 f_cnt=$((f_cnt + 1))
+
+                # Skip if rule already exists (prevents duplicates)
+                if grep -qxF "$virtual_path" "$existing_rules_file" 2>/dev/null; then
+                    log_debug "VFS Skip (already exists): $virtual_path"
+                    skip_cnt=$((skip_cnt + 1))
+                    echo "$f_cnt $s_cnt $w_cnt $skip_cnt" > "$count_file"
+                    echo "$virtual_path" >> "$tracking_file"
+                    continue
+                fi
 
                 if [ -c "$real_path" ]; then
                     log_debug "VFS Whiteout: $virtual_path"
@@ -581,7 +597,7 @@ register_module_vfs() {
                 fi
 
                 # Write updated counts
-                echo "$f_cnt $s_cnt $w_cnt" > "$count_file"
+                echo "$f_cnt $s_cnt $w_cnt $skip_cnt" > "$count_file"
 
                 # Track for later sync
                 echo "$virtual_path" >> "$tracking_file"
@@ -590,10 +606,14 @@ register_module_vfs() {
     done
 
     # Read final counts from temp file
+    local skip_count=0
     if [ -f "$count_file" ]; then
-        read file_count success_count whiteout_count < "$count_file"
+        read file_count success_count whiteout_count skip_count < "$count_file"
         rm -f "$count_file"
     fi
+
+    # Cleanup existing rules cache
+    rm -f "$existing_rules_file"
 
     # Update global VFS_REGISTERED_COUNT from marker file
     if [ -f "$count_file.global" ]; then
@@ -602,8 +622,8 @@ register_module_vfs() {
         rm -f "$count_file.global"
     fi
 
-    log_info "Module $mod_name: registered files via VFS"
-    log_debug "<<< EXIT: register_module_vfs (files=$file_count, success=$success_count, whiteouts=$whiteout_count)"
+    log_info "Module $mod_name: registered files via VFS (skipped $skip_count duplicates)"
+    log_debug "<<< EXIT: register_module_vfs (files=$file_count, success=$success_count, whiteouts=$whiteout_count, skipped=$skip_count)"
 
     register_sus_map_for_module "$mod_path" "$mod_name"
 }
@@ -683,6 +703,9 @@ hijack_mount() {
         return 1
     fi
 
+    # Track this module as processed to avoid double registration in process_modules_direct()
+    PROCESSED_MODULES="$PROCESSED_MODULES $mod_name "
+
     log_info "Registering VFS files for mount $mountpoint..."
     register_module_vfs "$mod_path" "$mod_name"
 
@@ -749,6 +772,12 @@ process_modules_direct() {
 
         if is_excluded "$mod_name"; then
             skipped_excluded=$((skipped_excluded + 1))
+            continue
+        fi
+
+        # Skip if already processed via hijack_mount() (universal_hijack mode)
+        if echo "$PROCESSED_MODULES" | grep -q " $mod_name "; then
+            log_debug "Skipping $mod_name (already processed via hijack_mount)"
             continue
         fi
 
@@ -916,6 +945,15 @@ cache_partition_devs
 register_hidden_mounts
 register_maps_patterns
 
+# Clear any stale rules from previous boot (important for disabled/removed modules)
+# This ensures only rules for CURRENTLY enabled modules are active
+log_info "Clearing previous boot VFS rules..."
+if "$LOADER" clear < /dev/null 2>/dev/null; then
+    log_info "Previous VFS rules cleared"
+else
+    log_warn "Failed to clear VFS rules (may not be critical if none existed)"
+fi
+
 # Enable NoMount hooks NOW - after partition cache is ready, before VFS rules
 # Module starts DISABLED to prevent early boot deadlock (kern_path on unmounted partitions)
 log_info "Enabling NoMount VFS hooks..."
@@ -1068,6 +1106,12 @@ save_rule_cache() {
     for pattern in "/data/adb" "magisk" "kernelsu" "zygisk"; do
         echo "addmap|$pattern|" >> "$temp_file"
     done
+
+    # Deduplicate rules before saving (preserves comments at top, deduplicates data lines)
+    local dedup_file="$NOMOUNT_DATA/.rule_cache_dedup_$$"
+    grep "^#" "$temp_file" > "$dedup_file" 2>/dev/null || true
+    grep -v "^#" "$temp_file" | sort -u >> "$dedup_file" 2>/dev/null || true
+    mv "$dedup_file" "$temp_file" 2>/dev/null
 
     # Atomic replace using rename
     if mv "$temp_file" "$cache_file" 2>/dev/null; then
