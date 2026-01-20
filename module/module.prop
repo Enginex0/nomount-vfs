@@ -1,7 +1,7 @@
 id=nomount
 metamodule=true
 name=NoMount VFS
-version=v0.6.1
-versionCode=7
+version=v0.6.2
+versionCode=8
 author=maxsteeel, Enginex0
 description=Zero-mount-footprint file injection via VFS path redirection. Supports KernelSU, APatch, and Magisk.
