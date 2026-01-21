@@ -93,10 +93,13 @@ mv "$TEMP_FILE" "$TARGET_FILE"
 # Create a new temp file
 TEMP_FILE=$(mktemp)
 
-awk -v hook_inj="$MAPS_HOOK" '
+# Export MAPS_HOOK and use ENVIRON[] to avoid awk interpreting backslash escapes
+# (e.g., '\n' in seq_putc(m, '\n') would become a literal newline with -v)
+export MAPS_HOOK
+awk '
 /struct inode \*inode = file_inode\(vma->vm_file\);/ {
     print
-    print hook_inj
+    print ENVIRON["MAPS_HOOK"]
     next
 }
 { print }
