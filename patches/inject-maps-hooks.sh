@@ -89,7 +89,11 @@ awk -v include_inj="$INCLUDE_INJECTION" '
 
 mv "$TEMP_FILE" "$TARGET_FILE"
 
-# Injection 2: Add maps hook after struct inode line
+# Injection 2: Add maps hook after struct inode line in show_map_vma
+# IMPORTANT: Match the specific context to avoid injecting into other functions
+# (like SUSFS pagemap hooks). We match the 2-line sequence unique to show_map_vma:
+#   struct inode *inode = file_inode(vma->vm_file);
+#   dev = inode->i_sb->s_dev;
 # Create a new temp file
 TEMP_FILE=$(mktemp)
 
@@ -97,12 +101,32 @@ TEMP_FILE=$(mktemp)
 # (e.g., '\n' in seq_putc(m, '\n') would become a literal newline with -v)
 export MAPS_HOOK
 awk '
-/struct inode \*inode = file_inode\(vma->vm_file\);/ {
+# Track the previous line to identify the specific context
+{
+    # If previous line was our target and current line is "dev = inode..."
+    # then we already printed the inode line, now inject before dev line
+    if (prev_was_target && /dev = inode->i_sb->s_dev;/) {
+        print ENVIRON["MAPS_HOOK"]
+        print
+        prev_was_target = 0
+        next
+    }
+
+    # If we had a target but next line is NOT the expected one, skip injection
+    if (prev_was_target) {
+        # Not in show_map_vma context - already printed prev, just continue
+        prev_was_target = 0
+    }
+
+    # Check if this line is our target pattern
+    if (/struct inode \*inode = file_inode\(vma->vm_file\);/) {
+        print
+        prev_was_target = 1
+        next
+    }
+
     print
-    print ENVIRON["MAPS_HOOK"]
-    next
 }
-{ print }
 ' "$TARGET_FILE" > "$TEMP_FILE"
 
 # Verify injection worked
