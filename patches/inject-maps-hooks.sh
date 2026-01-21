@@ -45,10 +45,15 @@ MAPS_HOOK=$(cat << 'HOOKEOF'
 #endif
 		/* hide_stuff: lineage path spoofing and jit-zygote-cache hiding */
 		{
+			/* C90: all declarations must come before executable statements */
+			struct inode *__hs_inode = file_inode(vma->vm_file);
 			const char *__hs_dname = file->f_path.dentry->d_name.name;
+			unsigned long long __hs_pgoff;
+			vm_flags_t __hs_flags;
+			/* Spoof lineage paths with fake framework path */
 			if (strstr(__hs_dname, "lineage")) {
-				unsigned long long __hs_pgoff = ((loff_t)vma->vm_pgoff) << PAGE_SHIFT;
-				vm_flags_t __hs_flags = vma->vm_flags;
+				__hs_pgoff = ((loff_t)vma->vm_pgoff) << PAGE_SHIFT;
+				__hs_flags = vma->vm_flags;
 				seq_setwidth(m, 25 + sizeof(void *) * 6 - 1);
 				seq_printf(m, "%08lx-%08lx %c%c%c%c %08llx %02x:%02x %lu ",
 					vma->vm_start, vma->vm_end,
@@ -57,12 +62,13 @@ MAPS_HOOK=$(cat << 'HOOKEOF'
 					__hs_flags & VM_EXEC ? 'x' : '-',
 					__hs_flags & VM_MAYSHARE ? 's' : 'p',
 					__hs_pgoff,
-					MAJOR(inode->i_sb->s_dev), MINOR(inode->i_sb->s_dev), inode->i_ino);
+					MAJOR(__hs_inode->i_sb->s_dev), MINOR(__hs_inode->i_sb->s_dev), __hs_inode->i_ino);
 				seq_pad(m, ' ');
 				seq_puts(m, "/system/framework/framework-res.apk");
 				seq_putc(m, '\n');
 				return;
 			}
+			/* Hide jit-zygote-cache entries completely */
 			if (strstr(__hs_dname, "jit-zygote-cache")) {
 				return;
 			}
