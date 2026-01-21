@@ -90,10 +90,9 @@ awk -v include_inj="$INCLUDE_INJECTION" '
 mv "$TEMP_FILE" "$TARGET_FILE"
 
 # Injection 2: Add maps hook after struct inode line in show_map_vma
-# IMPORTANT: Match the specific context to avoid injecting into other functions
-# (like SUSFS pagemap hooks). We match the 2-line sequence unique to show_map_vma:
-#   struct inode *inode = file_inode(vma->vm_file);
-#   dev = inode->i_sb->s_dev;
+# IMPORTANT: Track function context to only inject in show_map_vma, not other functions.
+# SUSFS may also add code after the inode line, so we can't rely on next-line matching.
+# Instead, we track when we enter show_map_vma and inject at the first inode line.
 # Create a new temp file
 TEMP_FILE=$(mktemp)
 
@@ -101,30 +100,33 @@ TEMP_FILE=$(mktemp)
 # (e.g., '\n' in seq_putc(m, '\n') would become a literal newline with -v)
 export MAPS_HOOK
 awk '
-# Track the previous line to identify the specific context
+BEGIN {
+    in_show_map_vma = 0
+    injected = 0
+}
 {
-    # If previous line was our target and current line is "dev = inode..."
-    # then we already printed the inode line, now inject before dev line
-    if (prev_was_target && /dev = inode->i_sb->s_dev;/) {
+    # Detect entering show_map_vma function
+    if (/^show_map_vma\(/ || /^static void$/ && prev_line ~ /^$/) {
+        # Next line might be the function signature
+    }
+    if (/show_map_vma\(struct seq_file \*m,/) {
+        in_show_map_vma = 1
+    }
+
+    # Detect leaving the function (next function definition or end of file section)
+    if (in_show_map_vma && /^static / && !/show_map_vma/) {
+        in_show_map_vma = 0
+    }
+
+    # If we are in show_map_vma and see the inode line, inject after it (only once)
+    if (in_show_map_vma && !injected && /struct inode \*inode = file_inode\(vma->vm_file\);/) {
+        print
         print ENVIRON["MAPS_HOOK"]
-        print
-        prev_was_target = 0
+        injected = 1
         next
     }
 
-    # If we had a target but next line is NOT the expected one, skip injection
-    if (prev_was_target) {
-        # Not in show_map_vma context - already printed prev, just continue
-        prev_was_target = 0
-    }
-
-    # Check if this line is our target pattern
-    if (/struct inode \*inode = file_inode\(vma->vm_file\);/) {
-        print
-        prev_was_target = 1
-        next
-    }
-
+    prev_line = $0
     print
 }
 ' "$TARGET_FILE" > "$TEMP_FILE"
