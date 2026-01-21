@@ -139,6 +139,10 @@ typedef unsigned long size_t;
 #define IOCTL_ADD_MAPS_PATTERN    0x40084E30  /* _IOW(0x4E, 0x30, char*) */
 #define IOCTL_CLEAR_MAPS_PATTERNS 0x4E32      /* _IO(0x4E, 0x32) */
 
+/* Module enable/disable IOCTLs - module starts DISABLED to prevent early boot deadlock */
+#define IOCTL_ENABLE              0x4E40      /* _IO(0x4E, 0x40) */
+#define IOCTL_DISABLE             0x4E41      /* _IO(0x4E, 0x41) */
+
 /* Structure for partition device spoofing */
 struct nm_partition_dev {
     int partition_id;
@@ -198,7 +202,7 @@ void c_main(long *sp) {
     long exit_code = 1; 
     
     if (argc < 2) {
-        sys3(SYS_WRITE, 1, (long)"nm add|del|clear|blk|unb|list|hide|unhide|clrhide|setdev|addmap|clrmap\n", 72);
+        sys3(SYS_WRITE, 1, (long)"nm add|del|clear|blk|unb|list|hide|unhide|clrhide|setdev|addmap|clrmap|enable|disable\n", 88);
         goto do_exit;
     }
 
@@ -215,8 +219,10 @@ void c_main(long *sp) {
     long ioctl_code = 0;
     int needed = 2;
     /* 'add' needs 4 args, but 'addmap' only needs 3 - check 4th char to distinguish */
+    /* Commands that need only 2 args: clear, version, list, addmap, clrhide, clrmap, enable, disable */
     if (cmd == 'a' && argv[1][1] == 'd' && argv[1][2] == 'd' && argv[1][3] != 'm') needed = 4;
-    else if (cmd != 'c' && cmd != 'v' && cmd != 'l' && cmd != 'a') needed = 3; 
+    else if (cmd != 'c' && cmd != 'v' && cmd != 'l' && cmd != 'a' && cmd != 'e' &&
+             !(cmd == 'd' && argv[1][1] == 'i')) needed = 3; 
     
     if (argc < needed) goto do_exit;
 
@@ -235,6 +241,14 @@ void c_main(long *sp) {
     /* clrmap - Clear all maps patterns */
     else if (cmd == 'c' && argv[1][1] == 'l' && argv[1][2] == 'r' && argv[1][3] == 'm') {
         ioctl_code = IOCTL_CLEAR_MAPS_PATTERNS;
+    }
+    /* enable - Enable NoMount hooks (module starts disabled to prevent boot deadlock) */
+    else if (cmd == 'e' && argv[1][1] == 'n') {
+        ioctl_code = IOCTL_ENABLE;
+    }
+    /* disable - Disable NoMount hooks */
+    else if (cmd == 'd' && argv[1][1] == 'i' && argv[1][2] == 's') {
+        ioctl_code = IOCTL_DISABLE;
     }
     /* unhide <mount_id> - Unhide mount */
     else if (cmd == 'u' && argv[1][1] == 'n' && argv[1][2] == 'h') {
