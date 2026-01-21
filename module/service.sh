@@ -149,12 +149,17 @@ mkdir -p "$SYNC_TRIGGER_DIR" 2>/dev/null
 LOG_LEVEL="${LOG_LEVEL:-4}"  # 0=off, 1=error, 2=warn, 3=info, 4=debug, 5=trace
 
 # Override log_err to also increment FAILED_COUNT
-_original_log_err() { :; }
+# Note: We wrap the original function directly (mksh-compatible)
 if type log_err >/dev/null 2>&1; then
-    eval "_original_log_err() { $(type log_err | tail -n +2); }"
+    # Save original as alias-style wrapper
+    _log_err_orig() {
+        _log_write "ERROR" "$@"
+    }
+else
+    _log_err_orig() { echo "[ERROR] $*" >&2; }
 fi
 log_err() {
-    _original_log_err "$@"
+    _log_err_orig "$@"
     FAILED_COUNT=$((FAILED_COUNT + 1))
 }
 
@@ -393,19 +398,23 @@ detect_all_module_mounts() {
     log_func_enter "detect_all_module_mounts"
     log_info "Scanning for ALL module-related mounts..."
 
-    # CRITICAL: Read /proc/mounts ONCE to avoid race conditions
-    # Mount state can change between reads, causing inconsistent detection
+    # Use cached /proc/mounts if available (to avoid deadlock after hooks enabled)
     local mounts_snapshot
-    log_trace "Reading /proc/mounts snapshot..."
-    mounts_snapshot=$(cat /proc/mounts 2>&1)
-    local cat_rc=$?
-    if [ $cat_rc -ne 0 ]; then
-        log_err "Failed to read /proc/mounts (rc=$cat_rc): $mounts_snapshot"
-        log_func_exit "detect_all_module_mounts" "error"
-        return 1
+    if [ -n "$CACHED_PROC_MOUNTS" ]; then
+        log_trace "Using cached /proc/mounts..."
+        mounts_snapshot="$CACHED_PROC_MOUNTS"
+    else
+        log_trace "Reading /proc/mounts snapshot..."
+        mounts_snapshot=$(cat /proc/mounts 2>&1)
+        local cat_rc=$?
+        if [ $cat_rc -ne 0 ]; then
+            log_err "Failed to read /proc/mounts (rc=$cat_rc): $mounts_snapshot"
+            log_func_exit "detect_all_module_mounts" "error"
+            return 1
+        fi
     fi
     local mount_line_count=$(echo "$mounts_snapshot" | wc -l)
-    log_debug "Read $mount_line_count lines from /proc/mounts"
+    log_debug "Using $mount_line_count lines from mounts data"
 
     local overlay_count=0 bind_count=0 loop_count=0 tmpfs_count=0
 
@@ -498,7 +507,13 @@ is_module_overlay() {
     local mountpoint="$1"
     log_func_enter "is_module_overlay" "$mountpoint"
 
-    local mount_line=$(grep " $mountpoint overlay " /proc/mounts 2>/dev/null)
+    # Use cached mounts if available (to avoid reading /proc/mounts after hooks enabled)
+    local mount_line
+    if [ -n "$CACHED_PROC_MOUNTS" ]; then
+        mount_line=$(echo "$CACHED_PROC_MOUNTS" | grep " $mountpoint overlay ")
+    else
+        mount_line=$(grep " $mountpoint overlay " /proc/mounts 2>/dev/null)
+    fi
     local options=$(echo "$mount_line" | awk '{print $4}')
     log_debug "Overlay options: ${options:0:200}..."
 
@@ -538,7 +553,13 @@ find_module_for_overlay() {
     local mountpoint="$1"
     log_func_enter "find_module_for_overlay" "$mountpoint"
 
-    local mount_line=$(grep " $mountpoint overlay " /proc/mounts 2>/dev/null)
+    # Use cached mounts if available (to avoid reading /proc/mounts after hooks enabled)
+    local mount_line
+    if [ -n "$CACHED_PROC_MOUNTS" ]; then
+        mount_line=$(echo "$CACHED_PROC_MOUNTS" | grep " $mountpoint overlay ")
+    else
+        mount_line=$(grep " $mountpoint overlay " /proc/mounts 2>/dev/null)
+    fi
     local options=$(echo "$mount_line" | awk '{print $4}')
 
     # Try lowerdir first (most common)
@@ -634,13 +655,9 @@ register_module_vfs() {
     mkdir -p "$tracking_dir"
     : > "$tracking_file"
 
-    # Cache existing VFS rules to avoid duplicates (one-time snapshot for efficiency)
-    local existing_rules_file="$NOMOUNT_DATA/.existing_rules_$$"
-    "$LOADER" list 2>/dev/null | sed 's/.*->//' > "$existing_rules_file" || : > "$existing_rules_file"
-
     # Use temp file to accumulate counts (avoids subshell variable isolation from pipe)
     local count_file="$NOMOUNT_DATA/.vfs_count_$$"
-    echo "0 0 0 0" > "$count_file"  # file_count success_count whiteout_count skip_count
+    echo "0 0 0" > "$count_file"  # file_count success_count whiteout_count
 
     for partition in $TARGET_PARTITIONS; do
         if [ -d "$mod_path/$partition" ]; then
@@ -651,17 +668,11 @@ register_module_vfs() {
                 virtual_path="${real_path#$mod_path}"
 
                 # Read current counts
-                read f_cnt s_cnt w_cnt skip_cnt < "$count_file"
+                read f_cnt s_cnt w_cnt < "$count_file"
                 f_cnt=$((f_cnt + 1))
 
-                # Skip if rule already exists (prevents duplicates)
-                if grep -qxF "$virtual_path" "$existing_rules_file" 2>/dev/null; then
-                    log_debug "VFS Skip (already exists): $virtual_path"
-                    skip_cnt=$((skip_cnt + 1))
-                    echo "$f_cnt $s_cnt $w_cnt $skip_cnt" > "$count_file"
-                    echo "$virtual_path" >> "$tracking_file"
-                    continue
-                fi
+                # ALWAYS re-add rules to ensure real_ino is populated with current inode
+                # This fixes the issue where cached rules from early boot have stale/zero inodes
 
                 if [ -c "$real_path" ]; then
                     # Whiteout (character device) - delete file
@@ -700,7 +711,7 @@ register_module_vfs() {
                 fi
 
                 # Write updated counts
-                echo "$f_cnt $s_cnt $w_cnt $skip_cnt" > "$count_file"
+                echo "$f_cnt $s_cnt $w_cnt" > "$count_file"
 
                 # Track for later sync
                 echo "$virtual_path" >> "$tracking_file"
@@ -709,14 +720,10 @@ register_module_vfs() {
     done
 
     # Read final counts from temp file
-    local skip_count=0
     if [ -f "$count_file" ]; then
-        read file_count success_count whiteout_count skip_count < "$count_file"
+        read file_count success_count whiteout_count < "$count_file"
         rm -f "$count_file"
     fi
-
-    # Cleanup existing rules cache
-    rm -f "$existing_rules_file"
 
     # Update global VFS_REGISTERED_COUNT from marker file
     if [ -f "$count_file.global" ]; then
@@ -725,8 +732,8 @@ register_module_vfs() {
         rm -f "$count_file.global"
     fi
 
-    log_info "Module $mod_name: registered files via VFS (skipped $skip_count duplicates)"
-    log_func_exit "register_module_vfs" "files=$file_count, success=$success_count, whiteouts=$whiteout_count, skipped=$skip_count"
+    log_info "Module $mod_name: registered $success_count files via VFS"
+    log_func_exit "register_module_vfs" "files=$file_count, success=$success_count, whiteouts=$whiteout_count"
 
     register_sus_map_for_module "$mod_path" "$mod_name"
 }
@@ -1048,20 +1055,32 @@ cache_partition_devs
 register_hidden_mounts
 register_maps_patterns
 
-# Clear any stale rules from previous boot (important for disabled/removed modules)
-# This ensures only rules for CURRENTLY enabled modules are active
-log_info "Clearing previous boot VFS rules..."
-log_debug "Executing: $LOADER clear"
-if "$LOADER" clear < /dev/null 2>/dev/null; then
-    log_info "Previous VFS rules cleared"
-    log_debug "$LOADER clear succeeded"
-else
-    log_warn "Failed to clear VFS rules (may not be critical if none existed)"
-    log_debug "$LOADER clear failed or no rules existed"
+# NOTE: We intentionally do NOT call "nm clear" here.
+# Clearing rules creates a race condition where fonts/libraries become
+# temporarily inaccessible, causing apps like Gboard to crash.
+# Instead, we register new rules (which overwrite old ones) and let
+# save_rule_cache() generate a clean cache at the end. Orphaned rules
+# for removed/disabled modules are harmless until next boot.
+# See: https://github.com/user/nomount/issues/XXX
+
+# CRITICAL: Cache /proc/mounts BEFORE enabling hooks!
+# Reading /proc/mounts after hooks are enabled causes kernel deadlock
+# because the VFS hooks intercept the read and cause recursive locking.
+log_info "Caching /proc/mounts (before hooks enabled)..."
+CACHED_PROC_MOUNTS=$(cat /proc/mounts 2>/dev/null)
+export CACHED_PROC_MOUNTS
+log_debug "Cached $(echo "$CACHED_PROC_MOUNTS" | wc -l) mount entries"
+
+mount_list=""
+if [ "$universal_hijack" = "true" ]; then
+    log_info "========== UNIVERSAL HIJACKER MODE =========="
+    log_info "Pre-scanning module mounts (using cached /proc/mounts)..."
+    mount_list=$(detect_all_module_mounts)
+    mount_count=$(echo "$mount_list" | grep -c . || echo 0)
+    log_info "Detected $mount_count module-related mounts"
 fi
 
-# Enable NoMount hooks NOW - after partition cache is ready, before VFS rules
-# Module starts DISABLED to prevent early boot deadlock (kern_path on unmounted partitions)
+# NOW enable NoMount hooks - after mount detection is complete
 log_info "Enabling NoMount VFS hooks..."
 log_debug "Executing: $LOADER enable"
 if "$LOADER" enable < /dev/null 2>/dev/null; then
@@ -1075,20 +1094,13 @@ fi
 log_info ""
 
 if [ "$universal_hijack" = "true" ]; then
-    log_info "========== UNIVERSAL HIJACKER MODE =========="
-
-    # Phase 1: Detect and hijack ALL existing mounts (overlay, bind, loop, tmpfs)
-    log_info "Detecting all module-related mounts..."
-    mount_list=$(detect_all_module_mounts)
-    mount_count=$(echo "$mount_list" | grep -c . || echo 0)
-    log_info "Detected $mount_count module-related mounts"
-
+    # Mount list was already captured above, before hooks were enabled
     if [ -n "$mount_list" ]; then
         log_info ""
         log_info "Hijacking all detected mounts..."
 
-        local hijack_success=0
-        local hijack_fail=0
+        hijack_success=0
+        hijack_fail=0
 
         # Use here-string to avoid subshell variable loss
         while read -r mount_info; do
@@ -1121,13 +1133,12 @@ fi
 if [ -f "$NOMOUNT_DATA/.exclusion_list" ]; then
     log_info ""
     log_info "Processing UID exclusion list..."
-    local uid_count=0
-    local uid_fail=0
+    uid_count=0
+    uid_fail=0
     while IFS= read -r uid; do
         [ -z "$uid" ] && continue
-        local blk_output
         blk_output=$("$LOADER" blk "$uid" 2>&1)
-        local blk_rc=$?
+        blk_rc=$?
         if [ $blk_rc -eq 0 ]; then
             log_info "UID blocked: $uid"
             uid_count=$((uid_count + 1))

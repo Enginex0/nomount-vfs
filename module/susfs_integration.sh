@@ -289,6 +289,7 @@ susfs_get_cached_metadata() {
 
 # ============================================================
 # FUNCTION: Apply SUSFS sus_path hiding
+# Note: Only works for EXISTING paths (replacements, not new files)
 # ============================================================
 susfs_apply_path() {
     local vpath="$1"
@@ -298,6 +299,26 @@ susfs_apply_path() {
     if [ "$HAS_SUSFS" != "1" ]; then
         log_debug "SUSFS not available, skipping"
         log_func_exit "susfs_apply_path" "skip" "no susfs"
+        return 0
+    fi
+
+    # Check if this is a NEW file (not in stock system)
+    # sus_path can only hide EXISTING paths, not newly injected ones
+    local cache_key cache_file
+    cache_key=$(echo "$vpath" | md5sum 2>/dev/null | cut -d' ' -f1)
+    [ -z "$cache_key" ] && cache_key=$(echo "$vpath" | cksum | cut -d' ' -f1)
+    cache_file="$METADATA_CACHE_DIR/$cache_key"
+
+    if [ -f "$cache_file" ] && grep -q "^NEW|" "$cache_file" 2>/dev/null; then
+        log_debug "Path is NEW file (not in stock), sus_path not needed: $vpath"
+        log_func_exit "susfs_apply_path" "skip" "new file"
+        return 0
+    fi
+
+    # Skip zero-byte files (whiteouts) - SUSFS can't hide empty files
+    if [ -f "$vpath" ] && [ ! -s "$vpath" ]; then
+        log_debug "Path is zero-byte whiteout, sus_path not needed: $vpath"
+        log_func_exit "susfs_apply_path" "skip" "whiteout"
         return 0
     fi
 
@@ -362,6 +383,18 @@ susfs_apply_maps() {
         return 0
     fi
 
+    # Check if this is a NEW file (not in stock system)
+    local cache_key cache_file
+    cache_key=$(echo "$vpath" | md5sum 2>/dev/null | cut -d' ' -f1)
+    [ -z "$cache_key" ] && cache_key=$(echo "$vpath" | cksum | cut -d' ' -f1)
+    cache_file="$METADATA_CACHE_DIR/$cache_key"
+
+    if [ -f "$cache_file" ] && grep -q "^NEW|" "$cache_file" 2>/dev/null; then
+        log_debug "Path is NEW file (not in stock), sus_maps not needed: $vpath"
+        log_func_exit "susfs_apply_maps" "skip" "new file"
+        return 0
+    fi
+
     log_susfs_cmd "add_sus_map" "$vpath"
     local result rc
     result=$("$SUSFS_BIN" add_sus_map "$vpath" 2>&1)
@@ -398,6 +431,19 @@ susfs_apply_kstat() {
     if [ "$HAS_SUS_KSTAT" != "1" ]; then
         log_debug "sus_kstat not supported"
         log_func_exit "susfs_apply_kstat" "skip" "not supported"
+        return 0
+    fi
+
+    # Check if this is a NEW file - skip kstat for NEW files
+    # NEW files should keep their actual size/blocks, not synthetic zeros
+    local cache_key cache_file
+    cache_key=$(echo "$vpath" | md5sum 2>/dev/null | cut -d' ' -f1)
+    [ -z "$cache_key" ] && cache_key=$(echo "$vpath" | cksum | cut -d' ' -f1)
+    cache_file="$METADATA_CACHE_DIR/$cache_key"
+
+    if [ -f "$cache_file" ] && grep -q "^NEW|" "$cache_file" 2>/dev/null; then
+        log_debug "Path is NEW file (not in stock), sus_kstat not needed: $vpath"
+        log_func_exit "susfs_apply_kstat" "skip" "new file"
         return 0
     fi
 

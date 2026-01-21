@@ -172,11 +172,9 @@ if [ -d "$MODULES_DIR" ]; then
                 log_trace "Scanning $mod_name/$partition"
                 find "$mod_path/$partition" -type f 2>/dev/null | while read -r real_path; do
                     vpath="${real_path#$mod_path}"
-                    # Only capture if original exists
-                    if [ -e "$vpath" ]; then
-                        if type susfs_capture_metadata >/dev/null 2>&1; then
-                            susfs_capture_metadata "$vpath"
-                        fi
+                    # Capture metadata for ALL files (existing get real stats, new get marked as NEW)
+                    if type susfs_capture_metadata >/dev/null 2>&1; then
+                        susfs_capture_metadata "$vpath"
                     fi
                 done
             fi
