@@ -652,6 +652,131 @@ susfs_clean_nomount_entries() {
 }
 
 # ============================================================
+# FUNCTION: Clean SUSFS entries for a specific module
+# More surgical than susfs_clean_nomount_entries() - only removes
+# entries that match paths from the specified module.
+# Called from monitor.sh unregister_module()
+# ============================================================
+susfs_clean_module_entries() {
+    local mod_name="$1"
+    local tracking_file="$2"  # Path to module's tracking file with virtual paths
+    log_func_enter "susfs_clean_module_entries" "$mod_name"
+
+    if [ "$HAS_SUSFS" != "1" ]; then
+        log_debug "SUSFS not available, skipping"
+        log_func_exit "susfs_clean_module_entries" "skip"
+        return 0
+    fi
+
+    if [ -z "$SUSFS_CONFIG_DIR" ]; then
+        log_debug "No SUSFS config directory"
+        log_func_exit "susfs_clean_module_entries" "skip"
+        return 0
+    fi
+
+    if [ ! -f "$tracking_file" ]; then
+        log_debug "No tracking file provided or file missing"
+        log_func_exit "susfs_clean_module_entries" "skip"
+        return 0
+    fi
+
+    log_info "Cleaning SUSFS entries for module: $mod_name"
+
+    local cleaned=0
+    local total_paths=$(wc -l < "$tracking_file" 2>/dev/null || echo 0)
+    log_debug "Processing $total_paths paths from tracking file"
+
+    # For each config file, remove entries matching tracked paths
+    for config in sus_path.txt sus_path_loop.txt sus_maps.txt sus_mount.txt; do
+        local config_path="$SUSFS_CONFIG_DIR/$config"
+        [ ! -f "$config_path" ] && continue
+
+        local before=$(wc -l < "$config_path")
+        local temp_file="${config_path}.tmp.$$"
+
+        # Filter out lines that match any path in the tracking file
+        # Also remove associated NoMount comment lines
+        while IFS= read -r line; do
+            local skip=0
+            # Skip comment lines that precede entries we're removing
+            if echo "$line" | grep -q "^# \[NoMount\]"; then
+                # Check if next line would be removed
+                continue  # Will be handled by the path matching
+            fi
+            # Check if this line matches any tracked path
+            while IFS= read -r tracked_path; do
+                [ -z "$tracked_path" ] && continue
+                if [ "$line" = "$tracked_path" ]; then
+                    skip=1
+                    break
+                fi
+            done < "$tracking_file"
+            [ "$skip" -eq 0 ] && echo "$line"
+        done < "$config_path" > "$temp_file"
+
+        # Replace original with filtered content
+        mv "$temp_file" "$config_path" 2>/dev/null
+
+        local after=$(wc -l < "$config_path")
+        local removed=$((before - after))
+        if [ $removed -gt 0 ]; then
+            log_debug "Removed $removed entries from $config"
+            cleaned=$((cleaned + removed))
+        fi
+    done
+
+    log_info "Cleaned $cleaned SUSFS entries for module $mod_name"
+    log_func_exit "susfs_clean_module_entries" "$cleaned"
+    return 0
+}
+
+# ============================================================
+# FUNCTION: Clean metadata cache for a specific module
+# Removes cached metadata files for paths from the specified module.
+# Called from monitor.sh unregister_module()
+# ============================================================
+susfs_clean_module_metadata_cache() {
+    local mod_name="$1"
+    local tracking_file="$2"  # Path to module's tracking file with virtual paths
+    log_func_enter "susfs_clean_module_metadata_cache" "$mod_name"
+
+    if [ ! -d "$METADATA_CACHE_DIR" ]; then
+        log_debug "No metadata cache directory"
+        log_func_exit "susfs_clean_module_metadata_cache" "skip"
+        return 0
+    fi
+
+    if [ ! -f "$tracking_file" ]; then
+        log_debug "No tracking file provided or file missing"
+        log_func_exit "susfs_clean_module_metadata_cache" "skip"
+        return 0
+    fi
+
+    log_info "Cleaning metadata cache for module: $mod_name"
+
+    local cleaned=0
+    while IFS= read -r vpath; do
+        [ -z "$vpath" ] && continue
+
+        # Generate cache key (same algorithm as susfs_capture_metadata)
+        local cache_key
+        cache_key=$(echo "$vpath" | md5sum 2>/dev/null | cut -d' ' -f1)
+        [ -z "$cache_key" ] && cache_key=$(echo "$vpath" | cksum | cut -d' ' -f1)
+
+        local cache_file="$METADATA_CACHE_DIR/$cache_key"
+        if [ -f "$cache_file" ]; then
+            rm -f "$cache_file"
+            cleaned=$((cleaned + 1))
+            log_trace "Removed metadata cache: $cache_file (for $vpath)"
+        fi
+    done < "$tracking_file"
+
+    log_info "Cleaned $cleaned metadata cache entries for module $mod_name"
+    log_func_exit "susfs_clean_module_metadata_cache" "$cleaned"
+    return 0
+}
+
+# ============================================================
 # MAIN API: Register rule with automatic SUSFS integration
 # This is the unified entry point that does EVERYTHING
 # ============================================================

@@ -1190,6 +1190,7 @@ save_rule_cache() {
     log_func_enter "save_rule_cache"
     local cache_file="$NOMOUNT_DATA/.rule_cache"
     local temp_file="$NOMOUNT_DATA/.rule_cache_tmp_$$"
+    local filtered_count=0
 
     log_info "Saving VFS rules to cache for early boot..."
 
@@ -1210,6 +1211,10 @@ save_rule_cache() {
     local list_rc=$?
     log_trace "$LOADER list returned rc=$list_rc"
 
+    # Use temp file to track filtered count (avoids subshell variable isolation from pipe)
+    local filter_count_file="$NOMOUNT_DATA/.filter_count_$$"
+    echo "0" > "$filter_count_file"
+
     if [ $list_rc -eq 0 ] && [ -n "$list_output" ]; then
         local rule_count=$(echo "$list_output" | wc -l)
         log_debug "$LOADER list returned $rule_count rules"
@@ -1218,10 +1223,51 @@ save_rule_cache() {
             # Parse kernel format: real_path->virtual_path
             local rpath="${line%%->*}"
             local vpath="${line##*->}"
-            [ -n "$vpath" ] && [ -n "$rpath" ] && echo "add|$vpath|$rpath" >> "$temp_file"
+
+            # VALIDATE: Check if real_path exists and module is active
+            local include_rule=1
+
+            # Check 1: real_path must exist
+            if [ -n "$rpath" ] && [ "$rpath" != "/nonexistent" ] && [ ! -e "$rpath" ]; then
+                log_debug "FILTERED: real_path missing - $vpath -> $rpath"
+                include_rule=0
+                echo "FILTER" >> "$filter_count_file"
+            fi
+
+            # Check 2: owning module must be active (not disabled/removed)
+            if [ "$include_rule" = "1" ] && echo "$rpath" | grep -q "/data/adb/modules/"; then
+                local mod_name
+                mod_name=$(echo "$rpath" | sed 's|.*/data/adb/modules/||' | cut -d/ -f1)
+                local mod_path="$MODULES_DIR/$mod_name"
+
+                if [ -f "$mod_path/disable" ]; then
+                    log_debug "FILTERED: module disabled - $vpath (module: $mod_name)"
+                    include_rule=0
+                    echo "FILTER" >> "$filter_count_file"
+                elif [ -f "$mod_path/remove" ]; then
+                    log_debug "FILTERED: module marked for removal - $vpath (module: $mod_name)"
+                    include_rule=0
+                    echo "FILTER" >> "$filter_count_file"
+                elif [ ! -d "$mod_path" ]; then
+                    log_debug "FILTERED: module missing - $vpath (module: $mod_name)"
+                    include_rule=0
+                    echo "FILTER" >> "$filter_count_file"
+                fi
+            fi
+
+            # Only save valid rules
+            if [ "$include_rule" = "1" ]; then
+                [ -n "$vpath" ] && [ -n "$rpath" ] && echo "add|$vpath|$rpath" >> "$temp_file"
+            fi
         done
     else
         log_debug "nm list returned no rules or failed (rc=$list_rc)"
+    fi
+
+    # Read filtered count from temp file (subtract 1 for initial "0" line)
+    if [ -f "$filter_count_file" ]; then
+        filtered_count=$(grep -c "FILTER" "$filter_count_file" 2>/dev/null || echo 0)
+        rm -f "$filter_count_file"
     fi
 
     # Also cache partition device IDs for stat spoofing
@@ -1256,7 +1302,8 @@ save_rule_cache() {
         local count=$(grep -c "^add|" "$cache_file" 2>/dev/null || echo 0)
         local setdev_count=$(grep -c "^setdev|" "$cache_file" 2>/dev/null || echo 0)
         local addmap_count=$(grep -c "^addmap|" "$cache_file" 2>/dev/null || echo 0)
-        log_info "Rule cache saved: $count add rules, $setdev_count setdev, $addmap_count addmap"
+        log_info "Rule cache saved: $count rules (filtered $filtered_count stale)"
+        log_debug "Cache breakdown: $count add, $setdev_count setdev, $addmap_count addmap"
 
         # Set restrictive permissions
         chmod 600 "$cache_file" 2>/dev/null

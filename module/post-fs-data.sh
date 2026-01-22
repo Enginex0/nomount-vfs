@@ -187,9 +187,99 @@ else
 fi
 
 # ============================================================
+# FUNCTION: Validate and clean stale cache entries
+# Removes entries for modules that are disabled, removed, or missing
+# Called BEFORE applying cached rules to prevent broken redirects
+# ============================================================
+validate_and_clean_cache() {
+    log_func_enter "validate_and_clean_cache"
+    local cache_file="$RULE_CACHE"
+
+    if [ ! -f "$cache_file" ]; then
+        log_debug "No cache file to validate"
+        log_func_exit "validate_and_clean_cache" "skip"
+        return 0
+    fi
+
+    local temp_cache="${cache_file}.validated.$$"
+    local removed=0
+    local kept=0
+
+    log_info "Validating cache entries against current module state..."
+
+    while IFS='|' read -r cmd vpath rpath || [ -n "$cmd" ]; do
+        [ -z "$cmd" ] && continue
+
+        # Pass through comments and non-add rules unchanged
+        case "$cmd" in
+            \#*)
+                echo "${cmd}|${vpath}|${rpath}" >> "$temp_cache"
+                continue
+                ;;
+            setdev|addmap|hide)
+                echo "${cmd}|${vpath}|${rpath}" >> "$temp_cache"
+                kept=$((kept + 1))
+                continue
+                ;;
+        esac
+
+        # For 'add' rules, validate the real_path
+        if [ "$cmd" = "add" ]; then
+            local keep_rule=1
+
+            # Check 1: Does real_path exist?
+            if [ -n "$rpath" ] && [ "$rpath" != "/nonexistent" ] && [ ! -e "$rpath" ]; then
+                log_debug "STALE: real_path missing - $vpath -> $rpath"
+                keep_rule=0
+            fi
+
+            # Check 2: Is the owning module disabled/removed?
+            if [ "$keep_rule" = "1" ] && echo "$rpath" | grep -q "/data/adb/modules/"; then
+                local mod_name
+                mod_name=$(echo "$rpath" | sed 's|.*/data/adb/modules/||' | cut -d/ -f1)
+                local mod_path="/data/adb/modules/$mod_name"
+
+                if [ -f "$mod_path/disable" ]; then
+                    log_debug "STALE: module disabled - $vpath (module: $mod_name)"
+                    keep_rule=0
+                elif [ -f "$mod_path/remove" ]; then
+                    log_debug "STALE: module marked for removal - $vpath (module: $mod_name)"
+                    keep_rule=0
+                elif [ ! -d "$mod_path" ]; then
+                    log_debug "STALE: module missing - $vpath (module: $mod_name)"
+                    keep_rule=0
+                fi
+            fi
+
+            if [ "$keep_rule" = "1" ]; then
+                echo "${cmd}|${vpath}|${rpath}" >> "$temp_cache"
+                kept=$((kept + 1))
+            else
+                removed=$((removed + 1))
+            fi
+        fi
+    done < "$cache_file"
+
+    # Replace cache with validated version
+    if [ "$removed" -gt 0 ]; then
+        mv "$temp_cache" "$cache_file" 2>/dev/null
+        log_info "Cache cleaned: removed $removed stale entries, kept $kept valid entries"
+    else
+        rm -f "$temp_cache" 2>/dev/null
+        log_debug "Cache validation complete: all $kept entries valid"
+    fi
+
+    log_func_exit "validate_and_clean_cache" "removed=$removed"
+    return 0
+}
+
+# ============================================================
 # LOAD AND APPLY CACHED RULES
 # ============================================================
 log_section "RULE CACHE LOADING"
+
+# CRITICAL: Validate and clean cache BEFORE loading
+validate_and_clean_cache
 
 # Check if cache exists
 if [ ! -f "$RULE_CACHE" ]; then
@@ -239,6 +329,14 @@ while IFS='|' read -r cmd vpath rpath || [ -n "$cmd" ]; do
             # Validate paths
             if [ -z "$vpath" ] || [ -z "$rpath" ]; then
                 log_warn "Rule #$rule_index: Invalid add rule (missing path)"
+                fail_count=$((fail_count + 1))
+                continue
+            fi
+
+            # CRITICAL: Validate real_path exists before applying
+            # This prevents crashes from stale cache entries for uninstalled modules
+            if [ "$rpath" != "/nonexistent" ] && [ ! -e "$rpath" ]; then
+                log_warn "Rule #$rule_index: SKIPPED (real_path missing) - $vpath -> $rpath"
                 fail_count=$((fail_count + 1))
                 continue
             fi
