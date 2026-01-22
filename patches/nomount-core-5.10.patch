@@ -72,7 +72,7 @@ new file mode 100644
 index 000000000..43ca3f0fa
 --- /dev/null
 +++ b/fs/vfs_dcache.c
-@@ -0,0 +1,2491 @@
+@@ -0,0 +1,2684 @@
 +#include <linux/module.h>
 +#include <linux/kernel.h>
 +#include <linux/init.h>
@@ -393,24 +393,37 @@ index 000000000..43ca3f0fa
 +
 +static dev_t nomount_get_partition_dev_for_path(const char *path)
 +{
-+	if (!path || path[0] != '/')
++	dev_t result;
++	const char *matched = NULL;
++
++	pr_info("nomount: [GET_PART_DEV_FOR_PATH] ENTER path=%s\n", path ? path : "(null)");
++
++	if (!path || path[0] != '/') {
++		pr_info("nomount: [GET_PART_DEV_FOR_PATH] invalid path -> 0\n");
 +		return 0;
++	}
 +
 +	/* Check longer prefixes first */
-+	if (strncmp(path, "/system_ext/", 12) == 0)
-+		return nm_partition_devs[NM_PART_SYSTEM_EXT];
-+	if (strncmp(path, "/system/", 8) == 0)
-+		return nm_partition_devs[NM_PART_SYSTEM];
-+	if (strncmp(path, "/vendor/", 8) == 0)
-+		return nm_partition_devs[NM_PART_VENDOR];
-+	if (strncmp(path, "/product/", 9) == 0)
-+		return nm_partition_devs[NM_PART_PRODUCT];
-+	if (strncmp(path, "/odm/", 5) == 0)
-+		return nm_partition_devs[NM_PART_ODM];
-+	if (strncmp(path, "/oem/", 5) == 0)
-+		return nm_partition_devs[NM_PART_OEM];
++	if (strncmp(path, "/system_ext/", 12) == 0) {
++		result = nm_partition_devs[NM_PART_SYSTEM_EXT]; matched = "/system_ext/";
++	} else if (strncmp(path, "/system/", 8) == 0) {
++		result = nm_partition_devs[NM_PART_SYSTEM]; matched = "/system/";
++	} else if (strncmp(path, "/vendor/", 8) == 0) {
++		result = nm_partition_devs[NM_PART_VENDOR]; matched = "/vendor/";
++	} else if (strncmp(path, "/product/", 9) == 0) {
++		result = nm_partition_devs[NM_PART_PRODUCT]; matched = "/product/";
++	} else if (strncmp(path, "/odm/", 5) == 0) {
++		result = nm_partition_devs[NM_PART_ODM]; matched = "/odm/";
++	} else if (strncmp(path, "/oem/", 5) == 0) {
++		result = nm_partition_devs[NM_PART_OEM]; matched = "/oem/";
++	} else {
++		pr_info("nomount: [GET_PART_DEV_FOR_PATH] NO_MATCH path=%s -> 0\n", path);
++		return 0;
++	}
 +
-+	return 0;
++	pr_info("nomount: [GET_PART_DEV_FOR_PATH] MATCHED prefix=%s path=%s -> dev=%u:%u\n",
++		matched, path, MAJOR(result), MINOR(result));
++	return result;
 +}
 +
 +/*
@@ -776,21 +789,32 @@ index 000000000..43ca3f0fa
 +	struct path path;
 +	int count = 0;
 +
++	pr_info("nomount: [INIT_PART_DEVS] starting partition device cache\n");
 +	NM_DBG("init_partition_devs: starting partition device cache\n");
 +
 +	if (nm_system_dev == 0 && kern_path("/system", LOOKUP_FOLLOW, &path) == 0) {
 +		nm_system_dev = path.dentry->d_sb->s_dev;
 +		path_put(&path);
++		pr_info("nomount: [INIT_PART_DEVS] /system -> dev=%u:%u\n",
++			MAJOR(nm_system_dev), MINOR(nm_system_dev));
 +		NM_DBG("init_partition_devs: /system -> dev=%u\n", nm_system_dev);
 +		count++;
++	} else {
++		pr_info("nomount: [INIT_PART_DEVS] /system NOT FOUND or already cached\n");
 +	}
 +	if (nm_vendor_dev == 0 && kern_path("/vendor", LOOKUP_FOLLOW, &path) == 0) {
 +		nm_vendor_dev = path.dentry->d_sb->s_dev;
 +		path_put(&path);
++		pr_info("nomount: [INIT_PART_DEVS] /vendor -> dev=%u:%u\n",
++			MAJOR(nm_vendor_dev), MINOR(nm_vendor_dev));
++		count++;
 +	}
 +	if (nm_product_dev == 0 && kern_path("/product", LOOKUP_FOLLOW, &path) == 0) {
 +		nm_product_dev = path.dentry->d_sb->s_dev;
 +		path_put(&path);
++		pr_info("nomount: [INIT_PART_DEVS] /product -> dev=%u:%u\n",
++			MAJOR(nm_product_dev), MINOR(nm_product_dev));
++		count++;
 +	}
 +	if (nm_odm_dev == 0 && kern_path("/odm", LOOKUP_FOLLOW, &path) == 0) {
 +		nm_odm_dev = path.dentry->d_sb->s_dev;
@@ -832,49 +856,80 @@ index 000000000..43ca3f0fa
 +	if (nm_vendor_dlkm_dev == 0 && kern_path("/vendor_dlkm", LOOKUP_FOLLOW, &path) == 0) {
 +		nm_vendor_dlkm_dev = path.dentry->d_sb->s_dev;
 +		path_put(&path);
++		pr_info("nomount: [INIT_PART_DEVS] /vendor_dlkm -> dev=%u:%u\n",
++			MAJOR(nm_vendor_dlkm_dev), MINOR(nm_vendor_dlkm_dev));
 +		NM_DBG("init_partition_devs: /vendor_dlkm -> dev=%u\n", nm_vendor_dlkm_dev);
 +		count++;
 +	}
 +
++	pr_info("nomount: [INIT_PART_DEVS] COMPLETE cached %d partition device IDs\n", count);
++	pr_info("nomount: [INIT_PART_DEVS] SUMMARY: system=%u vendor=%u product=%u odm=%u system_ext=%u\n",
++		nm_system_dev, nm_vendor_dev, nm_product_dev, nm_odm_dev, nm_system_ext_dev);
 +	NM_INFO("init_partition_devs: cached %d partition device IDs\n", count);
 +}
 +
 +/* Get appropriate device ID for a virtual path */
 +static dev_t nomount_get_partition_dev(const char *virtual_path)
 +{
-+	if (!virtual_path)
++	dev_t result;
++	const char *matched_prefix = "default_system";
++
++	pr_info("nomount: [GET_PART_DEV] ENTER vpath=%s\n", virtual_path ? virtual_path : "(null)");
++
++	if (!virtual_path) {
++		pr_info("nomount: [GET_PART_DEV] null path -> default system=%u\n", nm_system_dev);
 +		return nm_system_dev;
++	}
 +
 +	/* Standard AOSP partitions */
-+	if (strncmp(virtual_path, "/vendor_dlkm", 12) == 0 && nm_vendor_dlkm_dev != 0)
-+		return nm_vendor_dlkm_dev;
-+	if (strncmp(virtual_path, "/vendor", 7) == 0 && nm_vendor_dev != 0)
-+		return nm_vendor_dev;
-+	if (strncmp(virtual_path, "/product", 8) == 0 && nm_product_dev != 0)
-+		return nm_product_dev;
-+	if (strncmp(virtual_path, "/odm", 4) == 0 && nm_odm_dev != 0)
-+		return nm_odm_dev;
-+	if (strncmp(virtual_path, "/system_ext", 11) == 0 && nm_system_ext_dev != 0)
-+		return nm_system_ext_dev;
-+	if (strncmp(virtual_path, "/system_dlkm", 12) == 0 && nm_system_dlkm_dev != 0)
-+		return nm_system_dlkm_dev;
-+	if (strncmp(virtual_path, "/oem_dlkm", 9) == 0 && nm_oem_dlkm_dev != 0)
-+		return nm_oem_dlkm_dev;
-+	if (strncmp(virtual_path, "/oem", 4) == 0 && nm_oem_dev != 0)
-+		return nm_oem_dev;
++	if (strncmp(virtual_path, "/vendor_dlkm", 12) == 0 && nm_vendor_dlkm_dev != 0) {
++		result = nm_vendor_dlkm_dev; matched_prefix = "/vendor_dlkm"; goto found;
++	}
++	if (strncmp(virtual_path, "/vendor", 7) == 0 && nm_vendor_dev != 0) {
++		result = nm_vendor_dev; matched_prefix = "/vendor"; goto found;
++	}
++	if (strncmp(virtual_path, "/product", 8) == 0 && nm_product_dev != 0) {
++		result = nm_product_dev; matched_prefix = "/product"; goto found;
++	}
++	if (strncmp(virtual_path, "/odm", 4) == 0 && nm_odm_dev != 0) {
++		result = nm_odm_dev; matched_prefix = "/odm"; goto found;
++	}
++	if (strncmp(virtual_path, "/system_ext", 11) == 0 && nm_system_ext_dev != 0) {
++		result = nm_system_ext_dev; matched_prefix = "/system_ext"; goto found;
++	}
++	if (strncmp(virtual_path, "/system_dlkm", 12) == 0 && nm_system_dlkm_dev != 0) {
++		result = nm_system_dlkm_dev; matched_prefix = "/system_dlkm"; goto found;
++	}
++	if (strncmp(virtual_path, "/oem_dlkm", 9) == 0 && nm_oem_dlkm_dev != 0) {
++		result = nm_oem_dlkm_dev; matched_prefix = "/oem_dlkm"; goto found;
++	}
++	if (strncmp(virtual_path, "/oem", 4) == 0 && nm_oem_dev != 0) {
++		result = nm_oem_dev; matched_prefix = "/oem"; goto found;
++	}
 +
 +	/* OEM-specific partitions */
-+	if (strncmp(virtual_path, "/mi_ext", 7) == 0 && nm_mi_ext_dev != 0)
-+		return nm_mi_ext_dev;
-+	if (strncmp(virtual_path, "/my_heytap", 10) == 0 && nm_my_heytap_dev != 0)
-+		return nm_my_heytap_dev;
-+	if (strncmp(virtual_path, "/prism", 6) == 0 && nm_prism_dev != 0)
-+		return nm_prism_dev;
-+	if (strncmp(virtual_path, "/optics", 7) == 0 && nm_optics_dev != 0)
-+		return nm_optics_dev;
++	if (strncmp(virtual_path, "/mi_ext", 7) == 0 && nm_mi_ext_dev != 0) {
++		result = nm_mi_ext_dev; matched_prefix = "/mi_ext"; goto found;
++	}
++	if (strncmp(virtual_path, "/my_heytap", 10) == 0 && nm_my_heytap_dev != 0) {
++		result = nm_my_heytap_dev; matched_prefix = "/my_heytap"; goto found;
++	}
++	if (strncmp(virtual_path, "/prism", 6) == 0 && nm_prism_dev != 0) {
++		result = nm_prism_dev; matched_prefix = "/prism"; goto found;
++	}
++	if (strncmp(virtual_path, "/optics", 7) == 0 && nm_optics_dev != 0) {
++		result = nm_optics_dev; matched_prefix = "/optics"; goto found;
++	}
 +
 +	/* Default to system for any other partition */
++	pr_info("nomount: [GET_PART_DEV] NO_MATCH vpath=%s -> default system=%u\n",
++		virtual_path, nm_system_dev);
 +	return nm_system_dev;
++
++found:
++	pr_info("nomount: [GET_PART_DEV] MATCHED prefix=%s vpath=%s -> dev=%u:%u\n",
++		matched_prefix, virtual_path, MAJOR(result), MINOR(result));
++	return result;
 +}
 +
 +bool nomount_is_traversal_allowed(struct inode *inode, int mask) {
@@ -916,12 +971,18 @@ index 000000000..43ca3f0fa
 +	int bkt;
 +	bool match = false;
 +
++	pr_info("nomount: [IS_INJECTED] ENTER inode=%p\n", inode);
++
 +	if (!inode || NOMOUNT_DISABLED()) {
++		pr_info("nomount: [IS_INJECTED] SKIP: null_inode=%d disabled=%d\n",
++			!inode, NOMOUNT_DISABLED());
 +		NM_DBG("is_injected: early exit (null=%d disabled=%d)\n",
 +			!inode, NOMOUNT_DISABLED());
 +		return false;
 +	}
 +
++	pr_info("nomount: [IS_INJECTED] checking ino=%lu dev=%u:%u\n",
++		inode->i_ino, MAJOR(inode->i_sb->s_dev), MINOR(inode->i_sb->s_dev));
 +	NM_DBG("is_injected: checking ino=%lu dev=%u\n", inode->i_ino, inode->i_sb->s_dev);
 +
 +	rcu_read_lock();
@@ -929,6 +990,9 @@ index 000000000..43ca3f0fa
 +		/* Check both inode AND device to avoid cross-filesystem collision */
 +		if (rule->real_ino != 0 && rule->real_ino == inode->i_ino &&
 +		    rule->real_dev == inode->i_sb->s_dev) {
++			pr_info("nomount: [IS_INJECTED] MATCHED: ino=%lu dev=%u:%u -> vpath=%s\n",
++				inode->i_ino, MAJOR(inode->i_sb->s_dev), MINOR(inode->i_sb->s_dev),
++				rule->virtual_path);
 +			NM_DBG("is_injected: matched ino=%lu vpath=%s\n", inode->i_ino, rule->virtual_path);
 +			match = true;
 +			break;
@@ -936,6 +1000,8 @@ index 000000000..43ca3f0fa
 +	}
 +	rcu_read_unlock();
 +
++	pr_info("nomount: [IS_INJECTED] RESULT: ino=%lu -> %s\n",
++		inode->i_ino, match ? "INJECTED" : "NOT_INJECTED");
 +	NM_DBG("is_injected: ino=%lu result=%s\n", inode->i_ino, match ? "true" : "false");
 +	return match;
 +}
@@ -952,21 +1018,34 @@ index 000000000..43ca3f0fa
 +	ino_t orig_ino;
 +	bool found = false;
 +
-+	if (nomount_is_critical_process())
-+		return;
++	pr_info("nomount: [SPOOF_STAT] ENTER inode=%p stat=%p\n", inode, stat);
 +
-+	if (!inode || NOMOUNT_DISABLED())
++	if (nomount_is_critical_process()) {
++		pr_info("nomount: [SPOOF_STAT] SKIP: critical process\n");
 +		return;
++	}
 +
-+	if (nomount_is_uid_blocked(current_uid().val))
++	if (!inode || NOMOUNT_DISABLED()) {
++		pr_info("nomount: [SPOOF_STAT] SKIP: null_inode=%d disabled=%d\n",
++			!inode, NOMOUNT_DISABLED());
 +		return;
++	}
++
++	if (nomount_is_uid_blocked(current_uid().val)) {
++		pr_info("nomount: [SPOOF_STAT] SKIP: uid=%u blocked\n", current_uid().val);
++		return;
++	}
 +
 +	NOMOUNT_HOOK_ENTER();  /* Recursion guard - prevents stat->vfs_getattr->stat loop */
 +
++	pr_info("nomount: [SPOOF_STAT] checking ino=%lu dev=%u:%u\n",
++		inode->i_ino, MAJOR(inode->i_sb->s_dev), MINOR(inode->i_sb->s_dev));
 +	NM_DBG("spoof_stat: checking ino=%lu dev=%u\n", inode->i_ino, inode->i_sb->s_dev);
 +
-+	if (nm_system_dev == 0)
++	if (nm_system_dev == 0) {
++		pr_info("nomount: [SPOOF_STAT] nm_system_dev=0, initializing partition devs\n");
 +		nomount_init_partition_devs();
++	}
 +
 +	/* Find matching rule under RCU protection */
 +	rcu_read_lock();
@@ -977,9 +1056,13 @@ index 000000000..43ca3f0fa
 +			/* Copy data we need before exiting RCU */
 +			vpath_copy = kstrdup(rule->virtual_path, GFP_ATOMIC);
 +			matched_dev = rule->cached_partition_dev;
++			pr_info("nomount: [SPOOF_STAT] MATCHED: vpath=%s cached_dev=%u:%u\n",
++				rule->virtual_path, MAJOR(matched_dev), MINOR(matched_dev));
 +			/* Fallback to hardcoded lookup if cache not populated */
-+			if (matched_dev == 0)
++			if (matched_dev == 0) {
++				pr_info("nomount: [SPOOF_STAT] cached_dev=0, using prefix fallback\n");
 +				matched_dev = nomount_get_partition_dev(rule->virtual_path);
++			}
 +			matched_vino = rule->virtual_ino;
 +			found = true;
 +			NM_DBG("spoof_stat: matched rule vpath=%s\n", rule->virtual_path);
@@ -994,12 +1077,16 @@ index 000000000..43ca3f0fa
 +		orig_ino = stat->ino;
 +		stat->dev = matched_dev;
 +		stat->ino = matched_vino;
++		pr_info("nomount: [SPOOF_STAT] SPOOFED: dev=%u:%u->%u:%u ino=%lu->%lu\n",
++			MAJOR(orig_dev), MINOR(orig_dev), MAJOR(stat->dev), MINOR(stat->dev),
++			orig_ino, stat->ino);
 +		NM_INFO("spoof_stat: spoofed dev=%u->%u ino=%lu->%lu\n",
 +			orig_dev, stat->dev, orig_ino, stat->ino);
 +		if (vpath_copy) {
 +			nomount_get_parent_timestamps(vpath_copy, stat);
 +			kfree(vpath_copy);
 +		} else {
++			pr_info("nomount: [SPOOF_STAT] vpath_copy alloc failed, using static timestamps\n");
 +			NM_ERR("spoof_stat: failed to alloc vpath_copy, using static timestamps\n");
 +			/* Fallback to static timestamps if alloc failed */
 +			stat->atime.tv_sec = STOCK_ANDROID_TIME;
@@ -1010,9 +1097,12 @@ index 000000000..43ca3f0fa
 +			stat->ctime.tv_nsec = 0;
 +		}
 +	} else {
++		pr_info("nomount: [SPOOF_STAT] NO_MATCH: ino=%lu dev=%u:%u\n",
++			inode->i_ino, MAJOR(inode->i_sb->s_dev), MINOR(inode->i_sb->s_dev));
 +		NM_DBG("spoof_stat: no matching rule for ino=%lu dev=%u\n",
 +			inode->i_ino, inode->i_sb->s_dev);
 +	}
++	pr_info("nomount: [SPOOF_STAT] EXIT\n");
 +	NOMOUNT_HOOK_EXIT();  /* Recursion guard */
 +}
 +EXPORT_SYMBOL(nomount_spoof_stat);
@@ -1037,24 +1127,28 @@ index 000000000..43ca3f0fa
 +	ino_t orig_ino;
 +	bool rule_matched = false;
 +
-+	/* TEMP DEBUG - unconditional logging to trace execution */
-+	pr_info("nomount_spoof: ENTER path=%s dev=%u\n",
-+		path ? path : "(null)", stat ? stat->dev : 0);
++	/* UNCONDITIONAL DEBUG - trace every step */
++	pr_info("nomount: [SPOOF_STAT_DEV] ============ ENTER ============\n");
++	pr_info("nomount: [SPOOF_STAT_DEV] path=%s\n", path ? path : "(null)");
++	pr_info("nomount: [SPOOF_STAT_DEV] stat->dev=%u:%u stat->ino=%lu\n",
++		stat ? MAJOR(stat->dev) : 0, stat ? MINOR(stat->dev) : 0, stat ? stat->ino : 0);
++	pr_info("nomount: [SPOOF_STAT_DEV] caller uid=%u pid=%d comm=%s\n",
++		current_uid().val, current->pid, current->comm);
 +
 +	if (!path || !stat || NOMOUNT_DISABLED()) {
-+		pr_info("nomount_spoof: SKIP null=%d disabled=%d\n",
-+			!path || !stat, NOMOUNT_DISABLED());
++		pr_info("nomount: [SPOOF_STAT_DEV] SKIP: null_path=%d null_stat=%d disabled=%d\n",
++			!path, !stat, NOMOUNT_DISABLED());
 +		return;
 +	}
 +
 +	/* Skip spoofing for blocked UIDs (they can see through the injection) */
 +	if (nomount_is_uid_blocked(current_uid().val)) {
-+		pr_info("nomount: spoof_stat_dev SKIP uid=%u is blocked\n", current_uid().val);
++		pr_info("nomount: [SPOOF_STAT_DEV] SKIP: uid=%u is in blocked list\n", current_uid().val);
 +		return;
 +	}
++	pr_info("nomount: [SPOOF_STAT_DEV] UID CHECK PASSED: uid=%u not blocked\n", current_uid().val);
 +
-+	pr_info("nomount: spoof_stat_dev PROCEED uid=%u path=%s stat->ino=%lu\n",
-+		current_uid().val, path, stat->ino);
++	pr_info("nomount: [SPOOF_STAT_DEV] PHASE1: Attempting reverse lookup by real_path\n");
 +
 +	/*
 +	 * PHASE 1: Reverse lookup - path is the REAL path (target) of a rule
@@ -1064,18 +1158,27 @@ index 000000000..43ca3f0fa
 +	 * The reverse hash table (nomount_targets_ht) allows O(1) lookup by real_path.
 +	 */
 +	rule = nomount_lookup_by_real_path(path);
-+	pr_info("nomount_spoof: reverse_lookup path=%s rule=%p\n", path, rule);
++	pr_info("nomount: [SPOOF_STAT_DEV] PHASE1 result: rule=%p\n", rule);
 +	if (rule) {
 +		/* Use the cached partition device from the VIRTUAL path's mount */
 +		expected_dev = rule->cached_partition_dev;
-+		pr_info("nomount_spoof: FOUND rule vpath=%s cached_dev=%u\n",
-+			rule->virtual_path, expected_dev);
++		pr_info("nomount: [SPOOF_STAT_DEV] RULE FOUND:\n");
++		pr_info("nomount: [SPOOF_STAT_DEV]   virtual_path=%s\n", rule->virtual_path);
++		pr_info("nomount: [SPOOF_STAT_DEV]   real_path=%s\n", rule->real_path);
++		pr_info("nomount: [SPOOF_STAT_DEV]   cached_partition_dev=%u:%u\n",
++			MAJOR(expected_dev), MINOR(expected_dev));
++		pr_info("nomount: [SPOOF_STAT_DEV]   real_ino=%lu real_dev=%u:%u\n",
++			rule->real_ino, MAJOR(rule->real_dev), MINOR(rule->real_dev));
 +		if (expected_dev == 0) {
 +			/* Fallback to prefix-based lookup if cache not populated */
++			pr_info("nomount: [SPOOF_STAT_DEV] cached_dev=0, using prefix fallback\n");
 +			expected_dev = nomount_get_partition_dev(rule->virtual_path);
-+			pr_info("nomount_spoof: fallback dev=%u\n", expected_dev);
++			pr_info("nomount: [SPOOF_STAT_DEV] prefix fallback result: dev=%u:%u\n",
++				MAJOR(expected_dev), MINOR(expected_dev));
 +		}
 +		rule_matched = true;
++	} else {
++		pr_info("nomount: [SPOOF_STAT_DEV] PHASE1: NO rule found for this real_path\n");
 +	}
 +
 +	/*
@@ -1084,15 +1187,18 @@ index 000000000..43ca3f0fa
 +	 * appear to be on system partitions (e.g., /system/fonts/X.ttf).
 +	 */
 +	if (!rule_matched) {
-+		pr_info("nomount: spoof_stat_dev PHASE2 prefix fallback for path=%s\n", path);
++		pr_info("nomount: [SPOOF_STAT_DEV] PHASE2: prefix fallback (no rule matched)\n");
 +		expected_dev = nomount_get_partition_dev_for_path(path);
-+		pr_info("nomount: spoof_stat_dev PREFIX_CHECK path=%s -> expected_dev=%u\n",
-+			path, expected_dev);
++		pr_info("nomount: [SPOOF_STAT_DEV] PHASE2 result: expected_dev=%u:%u\n",
++			MAJOR(expected_dev), MINOR(expected_dev));
 +	}
 +
 +	/* Apply spoofing if we found a device to spoof to */
-+	pr_info("nomount_spoof: DECISION expected=%u actual=%u rule=%d\n",
-+		expected_dev, stat->dev, rule_matched);
++	pr_info("nomount: [SPOOF_STAT_DEV] ============ DECISION ============\n");
++	pr_info("nomount: [SPOOF_STAT_DEV] expected_dev=%u:%u actual_dev=%u:%u rule_matched=%d\n",
++		MAJOR(expected_dev), MINOR(expected_dev), MAJOR(stat->dev), MINOR(stat->dev), rule_matched);
++	pr_info("nomount: [SPOOF_STAT_DEV] expected_nonzero=%d mismatch=%d\n",
++		expected_dev != 0, stat->dev != expected_dev);
 +	if (expected_dev != 0 && stat->dev != expected_dev) {
 +		orig_dev = stat->dev;
 +		orig_ino = stat->ino;
@@ -1109,15 +1215,25 @@ index 000000000..43ca3f0fa
 +			stat->ino = full_name_hash(NULL, path, strlen(path));
 +		}
 +
-+		pr_info("nomount_spoof: APPLIED %s dev=%u->%u ino=%lu->%lu\n",
-+			path, orig_dev, stat->dev, orig_ino, stat->ino);
++		pr_info("nomount: [SPOOF_STAT_DEV] ============ SPOOFING APPLIED ============\n");
++		pr_info("nomount: [SPOOF_STAT_DEV] path=%s\n", path);
++		pr_info("nomount: [SPOOF_STAT_DEV] dev: %u:%u -> %u:%u\n",
++			MAJOR(orig_dev), MINOR(orig_dev), MAJOR(stat->dev), MINOR(stat->dev));
++		pr_info("nomount: [SPOOF_STAT_DEV] ino: %lu -> %lu\n", orig_ino, stat->ino);
 +
 +		/* Copy timestamps from parent directory for consistency */
 +		nomount_get_parent_timestamps(path, stat);
++		pr_info("nomount: [SPOOF_STAT_DEV] timestamps set to stock Android (2009-01-01)\n");
 +	} else {
-+		pr_info("nomount_spoof: NOOP path=%s expected=%u actual=%u\n",
-+			path, expected_dev, stat->dev);
++		pr_info("nomount: [SPOOF_STAT_DEV] ============ NO SPOOFING ============\n");
++		if (expected_dev == 0) {
++			pr_info("nomount: [SPOOF_STAT_DEV] REASON: expected_dev=0 (no partition match)\n");
++		} else {
++			pr_info("nomount: [SPOOF_STAT_DEV] REASON: dev already correct (%u:%u)\n",
++				MAJOR(stat->dev), MINOR(stat->dev));
++		}
 +	}
++	pr_info("nomount: [SPOOF_STAT_DEV] ============ EXIT ============\n");
 +}
 +EXPORT_SYMBOL(vfs_dcache_spoof_stat_dev);
 +
@@ -1198,7 +1314,10 @@ index 000000000..43ca3f0fa
 +	int i;
 +	int cached_count = 0;
 +
++	pr_info("nomount: [INIT_STATFS] ENTER\n");
++
 +	if (nm_statfs_initialized) {
++		pr_info("nomount: [INIT_STATFS] already initialized, skipping\n");
 +		NM_DBG("init_partition_statfs: already initialized\n");
 +		return;
 +	}
@@ -1206,22 +1325,28 @@ index 000000000..43ca3f0fa
 +	/* Set initializing flag to bypass redirects during cache init */
 +	nm_statfs_initializing = true;
 +
++	pr_info("nomount: [INIT_STATFS] starting statfs cache initialization\n");
 +	NM_DBG("init_partition_statfs: starting statfs cache initialization\n");
 +
 +	for (i = 0; partitions[i] != NULL && i < 17; i++) {
 +		if (kern_path(partitions[i], LOOKUP_FOLLOW, &path) == 0) {
 +			vfs_statfs(&path, &nm_cached_statfs[i]);
++			pr_info("nomount: [INIT_STATFS] cached[%d] %s f_type=0x%lx f_bsize=%ld\n",
++				i, partitions[i], (unsigned long)nm_cached_statfs[i].f_type,
++				nm_cached_statfs[i].f_bsize);
 +			NM_DBG("init_partition_statfs: cached %s (fstype=0x%lx)\n",
 +				partitions[i], nm_cached_statfs[i].f_type);
 +			path_put(&path);
 +			cached_count++;
 +		} else {
++			pr_info("nomount: [INIT_STATFS] partition[%d] %s NOT FOUND\n", i, partitions[i]);
 +			NM_DBG("init_partition_statfs: %s not found\n", partitions[i]);
 +		}
 +	}
 +
 +	nm_statfs_initializing = false;
 +	nm_statfs_initialized = true;
++	pr_info("nomount: [INIT_STATFS] COMPLETE cached statfs for %d partitions\n", cached_count);
 +	NM_INFO("init_partition_statfs: cached statfs for %d partitions\n", cached_count);
 +}
 +
@@ -1976,7 +2101,12 @@ index 000000000..43ca3f0fa
 +
 +	NM_INFO("add_rule: vpath=%s rpath=%s flags=0x%x\n", v_path, r_path, data.flags);
 +
++	/* UNCONDITIONAL DEBUG: Log rule addition details */
++	pr_info("nomount: [ADD_RULE] ENTRY vpath=%s rpath=%s flags=0x%x uid=%u pid=%d\n",
++		v_path, r_path, data.flags, current_uid().val, current->pid);
++
 +	hash = full_name_hash(NULL, v_path, strlen(v_path));
++	pr_info("nomount: [ADD_RULE] vpath_hash=0x%08x\n", hash);
 +	rule = kzalloc(sizeof(*rule), GFP_KERNEL);
 +	if (!rule) {
 +		NM_ERR("add_rule: failed to allocate rule struct\n");
@@ -2001,25 +2131,37 @@ index 000000000..43ca3f0fa
 +			rule->real_dev = path.dentry->d_sb->s_dev;
 +			NM_DBG("add_rule: real_ino=%lu real_dev=%u\n",
 +			       rule->real_ino, rule->real_dev);
++			pr_info("nomount: [ADD_RULE] real_path resolved: ino=%lu dev=%u:%u\n",
++				rule->real_ino, MAJOR(rule->real_dev), MINOR(rule->real_dev));
 +		}
 +		path_put(&path);
 +	} else {
 +		NM_ERR("add_rule: kern_path failed for %s (err=%d)\n", r_path, ret);
++		pr_info("nomount: [ADD_RULE] real_path FAILED to resolve: %s err=%d\n", r_path, ret);
 +		rule->real_ino = 0;
 +		rule->real_dev = 0;
 +	}
 +
 +	rule->virtual_ino = full_name_hash(NULL, v_path, strlen(v_path));
 +	NM_DBG("add_rule: virtual_ino=%lu hash=%u\n", rule->virtual_ino, hash);
++	pr_info("nomount: [ADD_RULE] virtual_ino=%lu vpath_hash=0x%08x\n", rule->virtual_ino, hash);
 +
 +	/* Cache partition metadata from virtual path for statfs spoofing */
++	pr_info("nomount: [ADD_RULE] caching partition metadata for vpath=%s\n", v_path);
 +	nomount_cache_partition_metadata(rule);
++	pr_info("nomount: [ADD_RULE] cached_partition_dev=%u:%u\n",
++		MAJOR(rule->cached_partition_dev), MINOR(rule->cached_partition_dev));
 +
 +	spin_lock(&nomount_lock);
-+	hash_add_rcu(nomount_rules_ht, &rule->node, hash);
-+	hash_add_rcu(nomount_targets_ht, &rule->target_node, nomount_hash_path(r_path));  /* Reverse lookup */
++	{
++		u32 rpath_hash = nomount_hash_path(r_path);
++		pr_info("nomount: [ADD_RULE] rpath_hash=0x%08x (for targets_ht)\n", rpath_hash);
++		hash_add_rcu(nomount_rules_ht, &rule->node, hash);
++		hash_add_rcu(nomount_targets_ht, &rule->target_node, rpath_hash);  /* Reverse lookup */
++	}
 +	list_add_tail(&rule->list, &nomount_rules_list);
 +	spin_unlock(&nomount_lock);
++	pr_info("nomount: [ADD_RULE] rule added to hash tables and list\n");
 +
 +	/* Mark parent directory for O(1) hide check optimization */
 +	nomount_mark_parent_has_hidden(v_path);
@@ -2036,6 +2178,8 @@ index 000000000..43ca3f0fa
 +	nomount_force_refresh_all();
 +
 +	NM_INFO("add_rule: success vpath=%s -> rpath=%s\n", v_path, r_path);
++	pr_info("nomount: [ADD_RULE] SUCCESS vpath=%s rpath=%s cached_dev=%u:%u\n",
++		v_path, r_path, MAJOR(rule->cached_partition_dev), MINOR(rule->cached_partition_dev));
 +	return 0;
 +}
 +
@@ -2522,6 +2666,32 @@ index 000000000..43ca3f0fa
 +		return nomount_ioctl_clear_maps_patterns();
 +	case NOMOUNT_IOC_ENABLE:
 +		NM_INFO("ioctl: ENABLE - activating NoMount hooks\n");
++		pr_info("nomount: [ENABLE] === DUMPING ALL RULES ===\n");
++		{
++			struct nomount_rule *__rule;
++			int __bkt, __count = 0;
++			rcu_read_lock();
++			hash_for_each_rcu(nomount_rules_ht, __bkt, __rule, node) {
++				__count++;
++				pr_info("nomount: [ENABLE] RULES_HT[%d] vpath=%s rpath=%s vhash=0x%08x cached_dev=%u:%u\n",
++					__bkt, __rule->virtual_path, __rule->real_path,
++					nomount_hash_path(__rule->virtual_path),
++					MAJOR(__rule->cached_partition_dev), MINOR(__rule->cached_partition_dev));
++			}
++			pr_info("nomount: [ENABLE] Total rules in nomount_rules_ht: %d\n", __count);
++			__count = 0;
++			hash_for_each_rcu(nomount_targets_ht, __bkt, __rule, target_node) {
++				__count++;
++				pr_info("nomount: [ENABLE] TARGETS_HT[%d] rpath=%s -> vpath=%s rhash=0x%08x\n",
++					__bkt, __rule->real_path, __rule->virtual_path,
++					nomount_hash_path(__rule->real_path));
++			}
++			pr_info("nomount: [ENABLE] Total rules in nomount_targets_ht: %d\n", __count);
++			rcu_read_unlock();
++			pr_info("nomount: [ENABLE] Partition dev cache: system=%u vendor=%u product=%u\n",
++				nm_system_dev, nm_vendor_dev, nm_product_dev);
++		}
++		pr_info("nomount: [ENABLE] === ACTIVATION COMPLETE ===\n");
 +		atomic_set(&nomount_enabled, 1);
 +		return 0;
 +	case NOMOUNT_IOC_DISABLE:
