@@ -168,7 +168,7 @@ index 000000000..43ca3f0fa
 +	 * strncmp with 12 chars matches "/system/etc/" prefix exactly.
 +	 * This avoids false matches like "/system/etcfoo".
 +	 */
-	if (strncmp(path, "/system/etc/", 12) == 0) {
++	if (strncmp(path, "/system/etc/", 12) == 0) {
 +		NM_DBG("normalize_path: %s -> %s\n", path, path + 7);
 +		return path + 7;  /* Skip "/system" prefix, keep "/etc/..." */
 +	}
