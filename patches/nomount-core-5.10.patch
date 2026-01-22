@@ -403,6 +403,12 @@ index 000000000..43ca3f0fa
 +		return 0;
 +	}
 +
++	/* Lazy initialization: ensure partition device cache is populated */
++	if (nm_partition_devs[NM_PART_SYSTEM] == 0 && nm_system_dev == 0) {
++		pr_info("nomount: [GET_PART_DEV_FOR_PATH] partition cache empty, initializing...\n");
++		nomount_init_partition_devs();
++	}
++
 +	/* Check longer prefixes first */
 +	if (strncmp(path, "/system_ext/", 12) == 0) {
 +		result = nm_partition_devs[NM_PART_SYSTEM_EXT]; matched = "/system_ext/";
@@ -416,6 +422,9 @@ index 000000000..43ca3f0fa
 +		result = nm_partition_devs[NM_PART_ODM]; matched = "/odm/";
 +	} else if (strncmp(path, "/oem/", 5) == 0) {
 +		result = nm_partition_devs[NM_PART_OEM]; matched = "/oem/";
++	} else if (strncmp(path, "/etc/", 5) == 0) {
++		/* /etc is symlink to /system/etc on Android - map to system partition */
++		result = nm_partition_devs[NM_PART_SYSTEM]; matched = "/etc/";
 +	} else {
 +		pr_info("nomount: [GET_PART_DEV_FOR_PATH] NO_MATCH path=%s -> 0\n", path);
 +		return 0;
@@ -866,6 +875,28 @@ index 000000000..43ca3f0fa
 +	pr_info("nomount: [INIT_PART_DEVS] SUMMARY: system=%u vendor=%u product=%u odm=%u system_ext=%u\n",
 +		nm_system_dev, nm_vendor_dev, nm_product_dev, nm_odm_dev, nm_system_ext_dev);
 +	NM_INFO("init_partition_devs: cached %d partition device IDs\n", count);
++
++	/*
++	 * CRITICAL: Also populate nm_partition_devs[] array which is used by
++	 * nomount_get_partition_dev_for_path(). This ensures prefix-based lookup
++	 * can find the correct device ID without relying on userspace ioctl.
++	 */
++	nm_partition_devs[NM_PART_SYSTEM] = nm_system_dev;
++	nm_partition_devs[NM_PART_VENDOR] = nm_vendor_dev;
++	nm_partition_devs[NM_PART_PRODUCT] = nm_product_dev;
++	nm_partition_devs[NM_PART_SYSTEM_EXT] = nm_system_ext_dev;
++	nm_partition_devs[NM_PART_ODM] = nm_odm_dev;
++	nm_partition_devs[NM_PART_OEM] = nm_oem_dev;
++	nm_partition_devs[NM_PART_MI_EXT] = nm_mi_ext_dev;
++	nm_partition_devs[NM_PART_MY_HEYTAP] = nm_my_heytap_dev;
++	nm_partition_devs[NM_PART_PRISM] = nm_prism_dev;
++	nm_partition_devs[NM_PART_OPTICS] = nm_optics_dev;
++	nm_partition_devs[NM_PART_OEM_DLKM] = nm_oem_dlkm_dev;
++	nm_partition_devs[NM_PART_SYSTEM_DLKM] = nm_system_dlkm_dev;
++	nm_partition_devs[NM_PART_VENDOR_DLKM] = nm_vendor_dlkm_dev;
++
++	pr_info("nomount: [INIT_PART_DEVS] nm_partition_devs[] synced: [0]=%u [1]=%u [2]=%u\n",
++		nm_partition_devs[0], nm_partition_devs[1], nm_partition_devs[2]);
 +}
 +
 +/* Get appropriate device ID for a virtual path */
@@ -1179,6 +1210,46 @@ index 000000000..43ca3f0fa
 +		rule_matched = true;
 +	} else {
 +		pr_info("nomount: [SPOOF_STAT_DEV] PHASE1: NO rule found for this real_path\n");
++	}
++
++	/*
++	 * PHASE 1.5: Look up by VIRTUAL path (for OverlayFS hook which passes virtual path)
++	 * The OverlayFS hook sends us the virtual path (e.g., "/etc/audio_effects.conf")
++	 * but nomount_lookup_by_real_path() looks in targets_ht which is keyed by real_path.
++	 * We need to also check nomount_rules_ht which is keyed by virtual_path.
++	 */
++	if (!rule_matched) {
++		const char *norm_vpath;
++		u32 vhash;
++		struct nomount_rule *vrule;
++
++		norm_vpath = nomount_normalize_path(path);
++		vhash = nomount_hash_path(norm_vpath);
++
++		pr_info("nomount: [SPOOF_STAT_DEV] PHASE1.5: virtual path lookup norm_vpath=%s hash=0x%08x\n",
++			norm_vpath, vhash);
++
++		rcu_read_lock();
++		hash_for_each_possible_rcu(nomount_rules_ht, vrule, node, vhash) {
++			const char *rule_norm = nomount_normalize_path(vrule->virtual_path);
++			pr_info("nomount: [SPOOF_STAT_DEV] PHASE1.5: checking rule vpath=%s norm=%s\n",
++				vrule->virtual_path, rule_norm);
++			if (strcmp(rule_norm, norm_vpath) == 0 || strcmp(vrule->virtual_path, path) == 0) {
++				expected_dev = vrule->cached_partition_dev;
++				if (expected_dev == 0) {
++					expected_dev = nomount_get_partition_dev(vrule->virtual_path);
++				}
++				rule_matched = true;
++				pr_info("nomount: [SPOOF_STAT_DEV] PHASE1.5: MATCHED rule vpath=%s cached_dev=%u:%u\n",
++					vrule->virtual_path, MAJOR(expected_dev), MINOR(expected_dev));
++				break;
++			}
++		}
++		rcu_read_unlock();
++
++		if (!rule_matched) {
++			pr_info("nomount: [SPOOF_STAT_DEV] PHASE1.5: NO rule found for virtual path\n");
++		}
 +	}
 +
 +	/*
@@ -1623,12 +1694,16 @@ index 000000000..43ca3f0fa
 +		return NULL;
 +	}
 +
-+	/* Normalize path for consistent hash lookup */
-+	norm_path = nomount_normalize_path(real_path);
-+	hash = nomount_hash_path(norm_path);
++	/*
++	 * DO NOT normalize real_path - real paths are like /data/adb/modules/X/...
++	 * They never have /system/etc/ prefix. Normalization is only for VIRTUAL paths.
++	 * The hash must match how r_path was hashed in nomount_ioctl_add_rule().
++	 */
++	hash = nomount_hash_path(real_path);
++	(void)norm_path; /* Unused - kept for future debugging if needed */
 +
-+	pr_info("nomount: lookup_by_real_path normalized=%s hash=0x%08x\n",
-+		norm_path, hash);
++	pr_info("nomount: lookup_by_real_path hash=0x%08x (no normalization for real paths)\n",
++		hash);
 +
 +	rcu_read_lock();
 +	hash_for_each_possible_rcu(nomount_targets_ht, rule, target_node, hash) {
@@ -1636,11 +1711,11 @@ index 000000000..43ca3f0fa
 +		pr_info("nomount: lookup_by_real_path BUCKET[%d] rule->real_path=%s rule->virtual_path=%s\n",
 +			bucket_count, rule->real_path, rule->virtual_path);
 +		/*
-+		 * Compare against normalized path. Also check original path
-+		 * for rules that were stored with /system/etc form.
++		 * Direct comparison - real_path is never normalized.
++		 * Real paths are like /data/adb/modules/X/... which don't have
++		 * the /system/etc/ prefix that normalization handles.
 +		 */
-+		if (strcmp(rule->real_path, norm_path) == 0 ||
-+		    strcmp(rule->real_path, real_path) == 0) {
++		if (strcmp(rule->real_path, real_path) == 0) {
 +			rcu_read_unlock();
 +			pr_info("nomount: lookup_by_real_path MATCH real_path=%s -> vpath=%s cached_dev=%u\n",
 +				real_path, rule->virtual_path, rule->cached_partition_dev);
@@ -2105,8 +2180,28 @@ index 000000000..43ca3f0fa
 +	pr_info("nomount: [ADD_RULE] ENTRY vpath=%s rpath=%s flags=0x%x uid=%u pid=%d\n",
 +		v_path, r_path, data.flags, current_uid().val, current->pid);
 +
++	/*
++	 * CRITICAL: Normalize virtual path BEFORE hashing for consistent lookup.
++	 * /system/etc/X -> /etc/X normalization ensures lookups match registration.
++	 * We store the normalized path so hash_for_each_possible_rcu finds it.
++	 */
++	{
++		const char *norm_vpath = nomount_normalize_path(v_path);
++		if (norm_vpath != v_path) {
++			/* Path was normalized - need to store normalized version */
++			char *norm_copy = kstrdup(norm_vpath, GFP_KERNEL);
++			if (norm_copy) {
++				pr_info("nomount: [ADD_RULE] NORMALIZED vpath: %s -> %s\n", v_path, norm_copy);
++				kfree(v_path);
++				v_path = norm_copy;
++			} else {
++				pr_info("nomount: [ADD_RULE] WARNING: kstrdup failed for normalized path, using original\n");
++			}
++		}
++	}
++
 +	hash = full_name_hash(NULL, v_path, strlen(v_path));
-+	pr_info("nomount: [ADD_RULE] vpath_hash=0x%08x\n", hash);
++	pr_info("nomount: [ADD_RULE] vpath_hash=0x%08x (normalized vpath=%s)\n", hash, v_path);
 +	rule = kzalloc(sizeof(*rule), GFP_KERNEL);
 +	if (!rule) {
 +		NM_ERR("add_rule: failed to allocate rule struct\n");
