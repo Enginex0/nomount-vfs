@@ -41,8 +41,12 @@ index a69e2cd36..8d52e7b00 100644
 @@ -265,6 +269,28 @@ char *d_path(const struct path *path, char *buf, int buflen)
  	struct path root;
  	int error;
- 
 +#ifdef CONFIG_FS_DCACHE_PREFETCH
++	int orig_buflen = buflen;  /* Save for post-processing (buflen modified by path_with_deleted) */
++#endif
+
++#ifdef CONFIG_FS_DCACHE_PREFETCH
++	/* Early intercept: inode-based lookup (fast path when real_ino is populated) */
 +	if (path->dentry && d_backing_inode(path->dentry)) {
 +		char *v_path = nomount_get_virtual_path_for_inode(d_backing_inode(path->dentry));
 +
@@ -67,6 +71,20 @@ index a69e2cd36..8d52e7b00 100644
  	/*
  	 * We have various synthetic filesystems that never get mounted.  On
  	 * these filesystems dentries are never used for lookup purposes, and
+@@ -285,6 +311,12 @@ char *d_path(const struct path *path, char *buf, int buflen)
+
+ 	if (error < 0)
+ 		res = ERR_PTR(error);
++#ifdef CONFIG_FS_DCACHE_PREFETCH
++	/*
++	 * Fallback: path-based reverse lookup for cases where inode lookup failed.
++	 * Uses O(1) hash lookup by real_path to find virtual_path replacement.
++	 * Must use orig_buflen since buflen is modified by path_with_deleted().
++	 */
++	res = nomount_process_d_path(buf, orig_buflen, res);
++#endif
+ 	return res;
+ }
 diff --git a/fs/namei.c b/fs/namei.c
 index 40e10b159..37b6954fc 100644
 --- a/fs/namei.c
@@ -165,6 +183,7 @@ index 000000000..43ca3f0fa
 +	do { if (nomount_debug >= 3) pr_debug("nomount: " fmt, ##__VA_ARGS__); } while(0)
 +
 +DEFINE_HASHTABLE(nomount_rules_ht, NOMOUNT_HASH_BITS);
++static DEFINE_HASHTABLE(nomount_targets_ht, NOMOUNT_HASH_BITS);
 +DEFINE_HASHTABLE(nomount_dirs_ht, NOMOUNT_HASH_BITS);
 +DEFINE_HASHTABLE(nomount_uid_ht, NOMOUNT_HASH_BITS);
 +DEFINE_HASHTABLE(nomount_hidden_mounts_ht, NM_MOUNT_HASH_BITS);
@@ -189,6 +208,62 @@ index 000000000..43ca3f0fa
 +	return uid_eq(current_uid(), GLOBAL_ROOT_UID) ||
 +		   uid_eq(current_euid(), GLOBAL_ROOT_UID) ||
 +		   capable(CAP_SYS_ADMIN);
++}
++
++/* Hash function for path strings (used for reverse lookups) */
++static inline u32 nomount_hash_path(const char *path)
++{
++	return full_name_hash(NULL, path, strlen(path));
++}
++
++/**
++ * nomount_normalize_path - Normalize path for consistent hash lookup
++ * @path: Input path string
++ *
++ * Returns: Normalized path (may return pointer into original string)
++ *
++ * Handles Android symlink mappings:
++ *   /system/etc/X -> /etc/X (because /etc -> /system/etc is a symlink)
++ *
++ * Does NOT change:
++ *   /system/fonts/X (fonts is actual directory, not symlink)
++ *   /vendor/X
++ *   /product/X
++ *
++ * This ensures that access via /etc/X and /system/etc/X produce
++ * the same hash for consistent hash table lookups.
++ */
++static inline const char *nomount_normalize_path(const char *path)
++{
++	if (!path)
++		return NULL;
++
++	/*
++	 * /etc is a symlink to /system/etc on Android.
++	 * Normalize /system/etc/X -> /etc/X for consistent hash lookup.
++	 *
++	 * strncmp with 12 chars matches "/system/etc/" prefix exactly.
++	 * This avoids false matches like "/system/etcfoo".
++	 */
++	if (strncmp(path, "/system/etc/", 12) == 0)
++		return path + 7;  /* Skip "/system" prefix, keep "/etc/..." */
++
++	/* Handle exact match "/system/etc" (without trailing slash or content) */
++	if (strcmp(path, "/system/etc") == 0)
++		return "/etc";
++
++	/* Handle trailing slash case "/system/etc/" -> "/etc/" */
++	if (strcmp(path, "/system/etc/") == 0)
++		return "/etc/";
++
++	/*
++	 * All other paths unchanged:
++	 * - /system/fonts/X (fonts is real directory, not symlink)
++	 * - /vendor/X
++	 * - /product/X
++	 * - /etc/X (already normalized)
++	 */
++	return path;
 +}
 +
 +struct linux_dirent {
@@ -703,6 +778,117 @@ index 000000000..43ca3f0fa
 +}
 +EXPORT_SYMBOL(nomount_get_virtual_path_for_inode);
 +
++/*
++ * O(1) reverse lookup: find rule by real_path using nomount_targets_ht
++ * Returns the rule if found, NULL otherwise. Caller must hold RCU read lock.
++ *
++ * Note: real_path is typically /data/adb/... (actual file location), not a
++ * virtual path like /etc/X. Normalization is applied for consistency but
++ * primarily benefits paths that might use /system/etc/ form.
++ */
++struct nomount_rule *nomount_lookup_by_real_path(const char *real_path)
++{
++	struct nomount_rule *rule;
++	const char *norm_path;
++	u32 hash;
++
++	if (!real_path || NOMOUNT_DISABLED())
++		return NULL;
++
++	/* Normalize path for consistent hash lookup */
++	norm_path = nomount_normalize_path(real_path);
++	hash = nomount_hash_path(norm_path);
++
++	rcu_read_lock();
++	hash_for_each_possible_rcu(nomount_targets_ht, rule, target_node, hash) {
++		/*
++		 * Compare against normalized path. Also check original path
++		 * for rules that were stored with /system/etc form.
++		 */
++		if (strcmp(rule->real_path, norm_path) == 0 ||
++		    strcmp(rule->real_path, real_path) == 0) {
++			rcu_read_unlock();
++			return rule;
++		}
++	}
++	rcu_read_unlock();
++	return NULL;
++}
++EXPORT_SYMBOL(nomount_lookup_by_real_path);
++
++/*
++ * Post-process d_path result: replace real_path with virtual_path if matched.
++ * Called AFTER d_path computes the physical path, to swap in virtual path.
++ *
++ * CRITICAL BUFFER HANDLING:
++ * d_path builds paths BACKWARDS from buf+buflen. The returned pointer 'res'
++ * points INTO the buffer, often not at buf[0]. When we replace with virtual_path,
++ * we must also build from the END of the buffer to maintain this contract.
++ *
++ * Parameters:
++ *   buf      - The original buffer passed to d_path
++ *   buflen   - The original buffer length
++ *   res      - The result from d_path (pointer into buf, or ERR_PTR)
++ *
++ * Returns:
++ *   - Pointer to virtual_path (in buf) if rule matched
++ *   - Original res if no match or disabled
++ *   - ERR_PTR(-ENAMETOOLONG) if virtual_path too long for buffer
++ */
++char *nomount_process_d_path(char *buf, int buflen, char *res)
++{
++	struct nomount_rule *rule;
++	size_t vp_len;
++	char *new_res;
++
++	/* Pass through errors or if disabled */
++	if (IS_ERR_OR_NULL(res) || NOMOUNT_DISABLED())
++		return res;
++
++	/* Skip if current process UID is blocked (e.g., root debugging) */
++	if (nomount_is_uid_blocked(current_uid().val))
++		return res;
++
++	/* Recursion guard - prevent infinite loops */
++	NOMOUNT_HOOK_ENTER_RET(res);
++
++	NM_DBG("process_d_path: checking res=%s\n", res);
++
++	/* O(1) reverse lookup: find rule where res == rule->real_path */
++	rule = nomount_lookup_by_real_path(res);
++	if (!rule || !rule->virtual_path) {
++		NM_DBG("process_d_path: no match for %s\n", res);
++		NOMOUNT_HOOK_EXIT();
++		return res;  /* No match, return original */
++	}
++
++	/* Found a match - replace with virtual_path */
++	vp_len = strlen(rule->virtual_path);
++
++	/* Safety check: ensure virtual_path fits in buffer */
++	if (vp_len + 1 > buflen) {
++		NM_ERR("process_d_path: virtual_path too long (%zu > %d)\n",
++			vp_len + 1, buflen);
++		NOMOUNT_HOOK_EXIT();
++		return ERR_PTR(-ENAMETOOLONG);
++	}
++
++	/*
++	 * Build virtual path from END of buffer (same as d_path does).
++	 * This maintains the contract that returned pointer is within buf.
++	 */
++	new_res = buf + buflen;
++	*--new_res = '\0';      /* Null terminator at end */
++	new_res -= vp_len;      /* Move back by path length */
++	memcpy(new_res, rule->virtual_path, vp_len);
++
++	NM_INFO("process_d_path: REPLACED %s -> %s\n", res, new_res);
++
++	NOMOUNT_HOOK_EXIT();
++	return new_res;
++}
++EXPORT_SYMBOL(nomount_process_d_path);
++
 +static unsigned long nomount_get_inode_by_path(const char *path_str) {
 +	struct path path;
 +	unsigned long ino = 0;
@@ -996,11 +1182,25 @@ index 000000000..43ca3f0fa
 +}
 +EXPORT_SYMBOL(nomount_spoof_stat);
 +
++/*
++ * Path-based stat spoofing - handles BOTH rule lookups AND prefix fallback.
++ * This is the primary stat spoofing function that uses PATH matching instead of
++ * inode matching. This fixes the fundamental bug where inode-based matching fails
++ * when a file is accessed via a different path than the one used to register the rule.
++ *
++ * Lookup order:
++ * 1. Reverse lookup: Check if path is a real_path (target) of any rule
++ *    Example: stat("/data/adb/.../audio.conf") -> found in nomount_targets_ht
++ * 2. Prefix fallback: Check if path starts with a system partition prefix
++ *    Example: stat("/system/fonts/X.ttf") for files without explicit rules
++ */
 +void vfs_dcache_spoof_stat_dev(const char *path, struct kstat *stat)
 +{
-+	dev_t expected_dev;
++	struct nomount_rule *rule;
++	dev_t expected_dev = 0;
 +	dev_t orig_dev;
 +	ino_t orig_ino;
++	bool rule_matched = false;
 +
 +	NM_DBG("spoof_stat_dev: ENTER path=%s stat=%p\n",
 +		path ? path : "(null)", stat);
@@ -1018,15 +1218,58 @@ index 000000000..43ca3f0fa
 +
 +	NM_DBG("spoof_stat_dev: checking path=%s\n", path);
 +
-+	expected_dev = nomount_get_partition_dev_for_path(path);
++	/*
++	 * PHASE 1: Reverse lookup - path is the REAL path (target) of a rule
++	 * This handles: stat("/data/adb/.../audio_effects.conf") when rule is
++	 * /etc/audio_effects.conf -> /data/adb/.../audio_effects.conf
++	 *
++	 * The reverse hash table (nomount_targets_ht) allows O(1) lookup by real_path.
++	 */
++	rule = nomount_lookup_by_real_path(path);
++	if (rule) {
++		/* Use the cached partition device from the VIRTUAL path's mount */
++		expected_dev = rule->cached_partition_dev;
++		if (expected_dev == 0) {
++			/* Fallback to prefix-based lookup if cache not populated */
++			expected_dev = nomount_get_partition_dev(rule->virtual_path);
++		}
++		rule_matched = true;
++		NM_DBG("spoof_stat_dev: REVERSE MATCH path=%s -> vpath=%s dev=%u\n",
++			path, rule->virtual_path, expected_dev);
++	}
 +
++	/*
++	 * PHASE 2: Prefix fallback - path starts with system partition prefix
++	 * This handles files that don't have explicit rules but should still
++	 * appear to be on system partitions (e.g., /system/fonts/X.ttf).
++	 */
++	if (!rule_matched) {
++		expected_dev = nomount_get_partition_dev_for_path(path);
++		NM_DBG("spoof_stat_dev: PREFIX CHECK path=%s -> expected_dev=%u\n",
++			path, expected_dev);
++	}
++
++	/* Apply spoofing if we found a device to spoof to */
 +	if (expected_dev != 0 && stat->dev != expected_dev) {
 +		orig_dev = stat->dev;
 +		orig_ino = stat->ino;
 +		stat->dev = expected_dev;
-+		stat->ino = full_name_hash(NULL, path, strlen(path));
-+		NM_INFO("spoof_stat_dev: path=%s dev=%u->%u ino=%lu->%lu\n",
++
++		/*
++		 * Inode spoofing:
++		 * - For rule-matched paths: XOR with magic for consistency
++		 * - For prefix fallback: hash the path for unique inode
++		 */
++		if (rule_matched) {
++			stat->ino ^= NOMOUNT_INODE_XOR_MAGIC;
++		} else {
++			stat->ino = full_name_hash(NULL, path, strlen(path));
++		}
++
++		NM_INFO("spoof_stat_dev: %s path=%s dev=%u->%u ino=%lu->%lu\n",
++			rule_matched ? "RULE" : "PREFIX",
 +			path, orig_dev, stat->dev, orig_ino, stat->ino);
++
 +		/* Copy timestamps from parent directory for consistency */
 +		nomount_get_parent_timestamps(path, stat);
 +	} else {
@@ -1099,6 +1342,7 @@ index 000000000..43ca3f0fa
 + */
 +static struct kstatfs nm_cached_statfs[17];
 +static bool nm_statfs_initialized = false;
++static bool nm_statfs_initializing = false;  /* Bypass redirects during cache init */
 +
 +static void nomount_init_partition_statfs(void)
 +{
@@ -1117,6 +1361,14 @@ index 000000000..43ca3f0fa
 +		return;
 +	}
 +
++	/*
++	 * CRITICAL: Set initializing flag BEFORE any kern_path() calls.
++	 * This bypasses NoMount path redirects so we get the REAL partition
++	 * statfs (erofs) instead of the redirected target's statfs (f2fs).
++	 * Without this, the cache gets "poisoned" with wrong filesystem types.
++	 */
++	nm_statfs_initializing = true;
++
 +	NM_DBG("init_partition_statfs: starting statfs cache initialization\n");
 +
 +	for (i = 0; partitions[i] != NULL && i < 17; i++) {
@@ -1130,6 +1382,9 @@ index 000000000..43ca3f0fa
 +			NM_DBG("init_partition_statfs: %s not found\n", partitions[i]);
 +		}
 +	}
++
++	/* Clear initializing flag and mark cache as ready */
++	nm_statfs_initializing = false;
 +	nm_statfs_initialized = true;
 +	NM_INFO("init_partition_statfs: cached statfs for %d partitions\n", cached_count);
 +}
@@ -1335,10 +1590,19 @@ index 000000000..43ca3f0fa
 +char *nomount_resolve_path(const char *pathname)
 +{
 +	struct nomount_rule *rule;
++	const char *norm_path;
 +	char *target = NULL;
 +	u32 hash;
 +
 +	if (nomount_is_critical_process())
++		return NULL;
++
++	/*
++	 * Bypass redirects during statfs cache initialization.
++	 * Without this check, kern_path("/system") during cache init would
++	 * follow our redirect rules and return f2fs statfs instead of erofs.
++	 */
++	if (nm_statfs_initializing)
 +		return NULL;
 +
 +	NM_DBG("resolve_path: ENTER pathname=%s\n", pathname ? pathname : "(null)");
@@ -1351,11 +1615,24 @@ index 000000000..43ca3f0fa
 +		return NULL;
 +	}
 +
-+	NM_DBG("resolve_path: looking up %s\n", pathname);
-+	hash = full_name_hash(NULL, pathname, strlen(pathname));
++	/*
++	 * Normalize path before hash lookup.
++	 * This handles /system/etc/X -> /etc/X mapping so that:
++	 * - Rule stored with hash("/etc/X")
++	 * - Access via "/system/etc/X" normalizes to "/etc/X"
++	 * - Same hash computed -> same bucket -> rule found
++	 */
++	norm_path = nomount_normalize_path(pathname);
++	NM_DBG("resolve_path: looking up %s (normalized: %s)\n", pathname,
++	       norm_path == pathname ? "unchanged" : norm_path);
++	hash = full_name_hash(NULL, norm_path, strlen(norm_path));
 +
 +	rcu_read_lock();
 +	hash_for_each_possible_rcu(nomount_rules_ht, rule, node, hash) {
++		/*
++		 * Use original pathname for matching since nomount_match_path()
++		 * already handles /system prefix stripping internally.
++		 */
 +		if (nomount_match_path(pathname, rule->virtual_path)) {
 +			if (rule->flags & NM_FLAG_ACTIVE) {
 +				target = kstrdup(rule->real_path, GFP_ATOMIC);
@@ -1795,6 +2072,8 @@ index 000000000..43ca3f0fa
 +
 +	spin_lock(&nomount_lock);
 +	hash_add_rcu(nomount_rules_ht, &rule->node, hash);
++	/* Add to reverse hash table for O(1) real_path -> rule lookups */
++	hash_add_rcu(nomount_targets_ht, &rule->target_node, nomount_hash_path(r_path));
 +	list_add_tail(&rule->list, &nomount_rules_list);
 +	spin_unlock(&nomount_lock);
 +
@@ -1843,6 +2122,7 @@ index 000000000..43ca3f0fa
 +		if (strcmp(rule->virtual_path, v_path) == 0) {
 +			NM_DBG("del_rule: found rule at bucket %d\n", bkt);
 +			hash_del_rcu(&rule->node);
++			hash_del_rcu(&rule->target_node);  /* Remove from reverse hash table */
 +			list_del(&rule->list);
 +			found = true;
 +			break;
@@ -1878,6 +2158,7 @@ index 000000000..43ca3f0fa
 +	hash_for_each_safe(nomount_rules_ht, bkt, tmp, rule, node) {
 +		NM_DBG("clear_rules: removing rule vpath=%s\n", rule->virtual_path);
 +		hash_del_rcu(&rule->node);
++		hash_del_rcu(&rule->target_node);  /* Remove from reverse hash table */
 +		list_del(&rule->list);
 +		call_rcu(&rule->rcu, nomount_free_rule_rcu);
 +		rule_count++;
@@ -2373,6 +2654,8 @@ index 000000000..9e0fb1b21
 +#define nomount_spoof_stat_dev       vfs_dcache_spoof_dev
 +#define nomount_maps_patterns_ht     vfs_dcache_maps_ht
 +#define nomount_should_hide_map      vfs_dcache_hide_map
++#define nomount_lookup_by_real_path  vfs_dcache_lookup_real
++#define nomount_targets_ht           vfs_dcache_targets_ht
 +
 +#include <linux/types.h>
 +#include <linux/list.h>
@@ -2387,6 +2670,7 @@ index 000000000..9e0fb1b21
 +#include <linux/rcupdate.h>
 +
 +#define NOMOUNT_MAGIC_CODE 0x4E /* 'N' */
++#define NOMOUNT_INODE_XOR_MAGIC 0x4E4F4D4F /* "NOMO" - XOR for spoofed inodes */
 +#define NOMOUNT_VERSION    1
 +#define NOMOUNT_HASH_BITS  10
 +#define NM_MOUNT_HASH_BITS 8
@@ -2429,6 +2713,7 @@ index 000000000..9e0fb1b21
 +
 +struct nomount_rule {
 +	struct hlist_node node;
++	struct hlist_node target_node;  /* For reverse hash table */
 +	struct list_head list;
 +	size_t vp_len;
 +	char *virtual_path;
@@ -2508,6 +2793,8 @@ index 000000000..9e0fb1b21
 +void nomount_inject_dents64(struct file *file, void __user **dirent, int *count, loff_t *pos);
 +void nomount_inject_dents(struct file *file, void __user **dirent, int *count, loff_t *pos);
 +char *nomount_get_virtual_path_for_inode(struct inode *inode);
++struct nomount_rule *nomount_lookup_by_real_path(const char *real_path);
++char *nomount_process_d_path(char *buf, int buflen, char *res);
 +bool nomount_is_traversal_allowed(struct inode *inode, int mask);
 +bool nomount_is_injected_file(struct inode *inode);
 +void nomount_spoof_stat(struct inode *inode, struct kstat *stat);
@@ -2523,6 +2810,8 @@ index 000000000..9e0fb1b21
 +static inline void nomount_inject_dents64(struct file *f, void __user **d, int *c, loff_t *p) {}
 +static inline void nomount_inject_dents(struct file *f, void __user **d, int *c, loff_t *p) {}
 +static inline char *nomount_get_virtual_path_for_inode(struct inode *inode) { return NULL; }
++static inline struct nomount_rule *nomount_lookup_by_real_path(const char *real_path) { return NULL; }
++static inline char *nomount_process_d_path(char *buf, int buflen, char *res) { return res; }
 +static inline bool nomount_is_traversal_allowed(struct inode *inode, int mask) { return false; }
 +static inline bool nomount_is_injected_file(struct inode *inode) { return false; }
 +static inline void nomount_spoof_stat(struct inode *inode, struct kstat *stat) {}
