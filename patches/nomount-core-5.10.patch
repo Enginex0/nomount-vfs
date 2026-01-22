@@ -1032,11 +1032,13 @@ index 000000000..43ca3f0fa
 +	ino_t orig_ino;
 +	bool rule_matched = false;
 +
-+	NM_DBG("spoof_stat_dev: ENTER path=%s stat=%p\n",
-+		path ? path : "(null)", stat);
++	/* TEMP DEBUG - unconditional logging to trace execution */
++	pr_info("nomount_spoof: ENTER path=%s dev=%u\n",
++		path ? path : "(null)", stat ? stat->dev : 0);
 +
 +	if (!path || !stat || NOMOUNT_DISABLED()) {
-+		NM_DBG("spoof_stat_dev: early exit (null/disabled)\n");
++		pr_info("nomount_spoof: SKIP null=%d disabled=%d\n",
++			!path || !stat, NOMOUNT_DISABLED());
 +		return;
 +	}
 +
@@ -1056,16 +1058,18 @@ index 000000000..43ca3f0fa
 +	 * The reverse hash table (nomount_targets_ht) allows O(1) lookup by real_path.
 +	 */
 +	rule = nomount_lookup_by_real_path(path);
++	pr_info("nomount_spoof: reverse_lookup path=%s rule=%p\n", path, rule);
 +	if (rule) {
 +		/* Use the cached partition device from the VIRTUAL path's mount */
 +		expected_dev = rule->cached_partition_dev;
++		pr_info("nomount_spoof: FOUND rule vpath=%s cached_dev=%u\n",
++			rule->virtual_path, expected_dev);
 +		if (expected_dev == 0) {
 +			/* Fallback to prefix-based lookup if cache not populated */
 +			expected_dev = nomount_get_partition_dev(rule->virtual_path);
++			pr_info("nomount_spoof: fallback dev=%u\n", expected_dev);
 +		}
 +		rule_matched = true;
-+		NM_DBG("spoof_stat_dev: REVERSE MATCH path=%s -> vpath=%s dev=%u\n",
-+			path, rule->virtual_path, expected_dev);
 +	}
 +
 +	/*
@@ -1080,6 +1084,8 @@ index 000000000..43ca3f0fa
 +	}
 +
 +	/* Apply spoofing if we found a device to spoof to */
++	pr_info("nomount_spoof: DECISION expected=%u actual=%u rule=%d\n",
++		expected_dev, stat->dev, rule_matched);
 +	if (expected_dev != 0 && stat->dev != expected_dev) {
 +		orig_dev = stat->dev;
 +		orig_ino = stat->ino;
@@ -1096,14 +1102,13 @@ index 000000000..43ca3f0fa
 +			stat->ino = full_name_hash(NULL, path, strlen(path));
 +		}
 +
-+		NM_INFO("spoof_stat_dev: %s path=%s dev=%u->%u ino=%lu->%lu\n",
-+			rule_matched ? "RULE" : "PREFIX",
++		pr_info("nomount_spoof: APPLIED %s dev=%u->%u ino=%lu->%lu\n",
 +			path, orig_dev, stat->dev, orig_ino, stat->ino);
 +
 +		/* Copy timestamps from parent directory for consistency */
 +		nomount_get_parent_timestamps(path, stat);
 +	} else {
-+		NM_DBG("spoof_stat_dev: no spoof needed for %s (expected_dev=%u stat->dev=%u)\n",
++		pr_info("nomount_spoof: NOOP path=%s expected=%u actual=%u\n",
 +			path, expected_dev, stat->dev);
 +	}
 +}
