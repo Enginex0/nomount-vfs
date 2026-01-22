@@ -87,8 +87,10 @@ inject_generic_fillattr_hook() {
     # Inject after stat->ino = inode->i_ino;
     sed -i '/stat->ino = inode->i_ino;/a\
 #ifdef CONFIG_FS_DCACHE_PREFETCH\
-	if (nomount_is_injected_file(inode))\
+	if (nomount_is_injected_file(inode)) {\
+		pr_info("nomount: HOOK generic_fillattr injected_file ino=%lu\\n", inode->i_ino);\
 		nomount_spoof_stat(inode, stat);\
+	}\
 #endif' "$TARGET"
 
     # Verify
@@ -125,9 +127,16 @@ inject_vfs_getattr_nosec_hook() {
 		char *__nm_buf = (char *)__get_free_page(GFP_KERNEL);\
 		if (__nm_buf) {\
 			char *__nm_path = d_path(path, __nm_buf, PAGE_SIZE);\
-			if (!IS_ERR(__nm_path))\
+			if (!IS_ERR(__nm_path)) {\
+				pr_info("nomount: HOOK vfs_getattr_nosec path=%s dev=%u ino=%lu\\n", __nm_path, stat->dev, stat->ino);\
 				vfs_dcache_spoof_stat_dev(__nm_path, stat);\
+				pr_info("nomount: HOOK vfs_getattr_nosec AFTER dev=%u ino=%lu\\n", stat->dev, stat->ino);\
+			} else {\
+				pr_info("nomount: HOOK vfs_getattr_nosec d_path FAILED err=%ld\\n", PTR_ERR(__nm_path));\
+			}\
 			free_page((unsigned long)__nm_buf);\
+		} else {\
+			pr_info("nomount: HOOK vfs_getattr_nosec page alloc FAILED\\n");\
 		}\
 	}\
 #endif' "$TARGET"

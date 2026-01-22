@@ -156,8 +156,12 @@ index 000000000..43ca3f0fa
 + */
 +static inline const char *nomount_normalize_path(const char *path)
 +{
++	const char *result;
++
++	pr_info("nomount: normalize_path ENTER input=%s\n", path ? path : "(null)");
++
 +	if (!path) {
-+		NM_DBG("normalize_path: null input\n");
++		pr_info("nomount: normalize_path EXIT null input\n");
 +		return NULL;
 +	}
 +
@@ -169,19 +173,20 @@ index 000000000..43ca3f0fa
 +	 * This avoids false matches like "/system/etcfoo".
 +	 */
 +	if (strncmp(path, "/system/etc/", 12) == 0) {
-+		NM_DBG("normalize_path: %s -> %s\n", path, path + 7);
-+		return path + 7;  /* Skip "/system" prefix, keep "/etc/..." */
++		result = path + 7;  /* Skip "/system" prefix, keep "/etc/..." */
++		pr_info("nomount: normalize_path BRANCH system_etc_prefix: %s -> %s\n", path, result);
++		return result;
 +	}
 +
 +	/* Handle exact match "/system/etc" (without trailing slash or content) */
 +	if (strcmp(path, "/system/etc") == 0) {
-+		NM_DBG("normalize_path: %s -> /etc\n", path);
++		pr_info("nomount: normalize_path BRANCH system_etc_exact: %s -> /etc\n", path);
 +		return "/etc";
 +	}
 +
 +	/* Handle trailing slash case "/system/etc/" -> "/etc/" */
 +	if (strcmp(path, "/system/etc/") == 0) {
-+		NM_DBG("normalize_path: %s -> /etc/\n", path);
++		pr_info("nomount: normalize_path BRANCH system_etc_slash: %s -> /etc/\n", path);
 +		return "/etc/";
 +	}
 +
@@ -192,7 +197,7 @@ index 000000000..43ca3f0fa
 +	 * - /product/X
 +	 * - /etc/X (already normalized)
 +	 */
-+	NM_DBG("normalize_path: %s (unchanged)\n", path);
++	pr_info("nomount: normalize_path EXIT unchanged: %s\n", path);
 +	return path;
 +}
 +
@@ -1044,11 +1049,12 @@ index 000000000..43ca3f0fa
 +
 +	/* Skip spoofing for blocked UIDs (they can see through the injection) */
 +	if (nomount_is_uid_blocked(current_uid().val)) {
-+		NM_DBG("spoof_stat_dev: uid %u blocked\n", current_uid().val);
++		pr_info("nomount: spoof_stat_dev SKIP uid=%u is blocked\n", current_uid().val);
 +		return;
 +	}
 +
-+	NM_DBG("spoof_stat_dev: checking path=%s\n", path);
++	pr_info("nomount: spoof_stat_dev PROCEED uid=%u path=%s stat->ino=%lu\n",
++		current_uid().val, path, stat->ino);
 +
 +	/*
 +	 * PHASE 1: Reverse lookup - path is the REAL path (target) of a rule
@@ -1078,8 +1084,9 @@ index 000000000..43ca3f0fa
 +	 * appear to be on system partitions (e.g., /system/fonts/X.ttf).
 +	 */
 +	if (!rule_matched) {
++		pr_info("nomount: spoof_stat_dev PHASE2 prefix fallback for path=%s\n", path);
 +		expected_dev = nomount_get_partition_dev_for_path(path);
-+		NM_DBG("spoof_stat_dev: PREFIX CHECK path=%s -> expected_dev=%u\n",
++		pr_info("nomount: spoof_stat_dev PREFIX_CHECK path=%s -> expected_dev=%u\n",
 +			path, expected_dev);
 +	}
 +
@@ -1480,19 +1487,29 @@ index 000000000..43ca3f0fa
 +	struct nomount_rule *rule;
 +	const char *norm_path;
 +	u32 hash;
++	int bucket_count = 0;
 +
-+	if (!real_path || NOMOUNT_DISABLED())
++	pr_info("nomount: lookup_by_real_path ENTER real_path=%s\n",
++		real_path ? real_path : "(null)");
++
++	if (!real_path || NOMOUNT_DISABLED()) {
++		pr_info("nomount: lookup_by_real_path SKIP null=%d disabled=%d\n",
++			!real_path, NOMOUNT_DISABLED());
 +		return NULL;
++	}
 +
 +	/* Normalize path for consistent hash lookup */
 +	norm_path = nomount_normalize_path(real_path);
 +	hash = nomount_hash_path(norm_path);
 +
-+	NM_DBG("lookup_by_real_path: checking %s (normalized: %s)\n",
-+		real_path, norm_path == real_path ? "unchanged" : norm_path);
++	pr_info("nomount: lookup_by_real_path normalized=%s hash=0x%08x\n",
++		norm_path, hash);
 +
 +	rcu_read_lock();
 +	hash_for_each_possible_rcu(nomount_targets_ht, rule, target_node, hash) {
++		bucket_count++;
++		pr_info("nomount: lookup_by_real_path BUCKET[%d] rule->real_path=%s rule->virtual_path=%s\n",
++			bucket_count, rule->real_path, rule->virtual_path);
 +		/*
 +		 * Compare against normalized path. Also check original path
 +		 * for rules that were stored with /system/etc form.
@@ -1500,13 +1517,14 @@ index 000000000..43ca3f0fa
 +		if (strcmp(rule->real_path, norm_path) == 0 ||
 +		    strcmp(rule->real_path, real_path) == 0) {
 +			rcu_read_unlock();
-+			NM_INFO("lookup_by_real_path: FOUND %s -> vpath=%s\n",
-+				real_path, rule->virtual_path);
++			pr_info("nomount: lookup_by_real_path MATCH real_path=%s -> vpath=%s cached_dev=%u\n",
++				real_path, rule->virtual_path, rule->cached_partition_dev);
 +			return rule;
 +		}
 +	}
 +	rcu_read_unlock();
-+	NM_DBG("lookup_by_real_path: no match for %s\n", real_path);
++	pr_info("nomount: lookup_by_real_path NO_MATCH real_path=%s checked=%d rules in bucket\n",
++		real_path, bucket_count);
 +	return NULL;
 +}
 +EXPORT_SYMBOL(nomount_lookup_by_real_path);
