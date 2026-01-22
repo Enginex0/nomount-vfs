@@ -72,7 +72,7 @@ new file mode 100644
 index 000000000..43ca3f0fa
 --- /dev/null
 +++ b/fs/vfs_dcache.c
-@@ -0,0 +1,2684 @@
+@@ -0,0 +1,2687 @@
 +#include <linux/module.h>
 +#include <linux/kernel.h>
 +#include <linux/init.h>
@@ -270,6 +270,9 @@ index 000000000..43ca3f0fa
 +
 +/* Partition device array for path-based stat spoofing */
 +static dev_t nm_partition_devs[NM_PART_COUNT];
++
++/* Forward declaration - defined later in file */
++static void nomount_init_partition_devs(void);
 +
 +#define STOCK_ANDROID_TIME 1230768000
 +
