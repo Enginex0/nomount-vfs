@@ -131,6 +131,29 @@ PROCESSED_MODULES=""
 mkdir -p "$NOMOUNT_DATA" 2>/dev/null
 chmod 755 "$NOMOUNT_DATA" 2>/dev/null
 
+# Cleanup handler for temp files on unexpected exit
+cleanup_on_exit() {
+    rm -f "$NOMOUNT_DATA/.vfs_count_"* 2>/dev/null
+    rm -f "$NOMOUNT_DATA/.rule_cache_"* 2>/dev/null
+    rm -f "$NOMOUNT_DATA/.*_$$" 2>/dev/null
+}
+trap cleanup_on_exit EXIT INT TERM HUP
+
+# Clean stale temp files from previous crashed sessions
+# Only delete if file is old AND the PID in filename is not running
+for stale_file in "$NOMOUNT_DATA"/.*_*; do
+    [ -f "$stale_file" ] || continue
+    # Extract PID from filename (pattern: .something_PID)
+    stale_pid="${stale_file##*_}"
+    # Only delete if PID is numeric and process is not running
+    case "$stale_pid" in
+        ''|*[!0-9]*) continue ;;  # Skip if not numeric
+    esac
+    if ! kill -0 "$stale_pid" 2>/dev/null; then
+        rm -f "$stale_file" 2>/dev/null
+    fi
+done
+
 # ============================================================
 # External Sync Trigger API Directory
 # ============================================================

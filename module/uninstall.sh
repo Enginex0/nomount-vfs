@@ -57,6 +57,35 @@ else
     # Only remove if the module doesn't have its own legitimate skip_mount
     # We can't reliably distinguish, so we'll be conservative
     log_cleanup "  No skipped_modules record - modules will use overlay on next boot"
+
+    # Fallback: If skipped_modules file was missing, scan for potential orphans
+    log_cleanup "  Scanning for orphan skip_mount files..."
+    # Only remove skip_mount if we have evidence NoMount created it
+    # (corresponding tracking file exists in module_paths)
+    if [ -d "$NOMOUNT_DATA/module_paths" ]; then
+        for tracking_file in "$NOMOUNT_DATA/module_paths"/*; do
+            [ -f "$tracking_file" ] || continue
+            # Validate tracking file: must be regular file with valid content
+            # Skip if it's a symlink (potential attack vector)
+            [ -L "$tracking_file" ] && continue
+            # Validate content: first line should be a path starting with /
+            first_line=$(head -1 "$tracking_file" 2>/dev/null)
+            case "$first_line" in
+                /*) ;;  # Valid path format
+                *) continue ;;  # Skip invalid/empty files
+            esac
+            mod_name="${tracking_file##*/}"
+            # Additional validation: module name should be alphanumeric with limited special chars
+            case "$mod_name" in
+                *[!a-zA-Z0-9._-]*) continue ;;  # Skip if contains invalid chars
+            esac
+            skip_mount_file="/data/adb/modules/$mod_name/skip_mount"
+            if [ -f "$skip_mount_file" ]; then
+                rm -f "$skip_mount_file"
+                log_cleanup "    Removed orphan: $skip_mount_file"
+            fi
+        done
+    fi
 fi
 
 # ============================================================
@@ -71,6 +100,25 @@ if command -v ksu_susfs >/dev/null 2>&1; then
     ksu_susfs del_sus_path /sys/devices/virtual/misc/vfs_helper 2>/dev/null
 
     log_cleanup "  Removed SUSFS path hiding entries"
+fi
+
+# Clean NoMount entries from SUSFS config files
+log_cleanup "Cleaning SUSFS config entries..."
+if [ -f "$MODDIR/susfs_integration.sh" ]; then
+    # Source with required variables
+    NOMOUNT_DATA="/data/adb/nomount"
+    . "$MODDIR/susfs_integration.sh"
+    if type susfs_clean_nomount_entries >/dev/null 2>&1; then
+        if susfs_clean_nomount_entries; then
+            log_cleanup "  SUSFS entries cleaned"
+        else
+            log_cleanup "  WARNING: SUSFS cleanup may have failed (some entries might remain)"
+        fi
+    else
+        log_cleanup "  SUSFS cleanup function not available"
+    fi
+else
+    log_cleanup "  susfs_integration.sh not found - skipping SUSFS cleanup"
 fi
 
 # ============================================================

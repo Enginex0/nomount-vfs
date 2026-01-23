@@ -786,6 +786,24 @@ nm_register_rule_with_susfs() {
     local loader="${3:-$LOADER}"
     log_func_enter "nm_register_rule_with_susfs" "$vpath" "$rpath"
 
+    # Input validation
+    if [ -z "$vpath" ]; then
+        log_warn "nm_register_rule_with_susfs: empty vpath"
+        return 1
+    fi
+    if [ -z "$rpath" ]; then
+        log_warn "nm_register_rule_with_susfs: empty rpath"
+        return 1
+    fi
+    if [ ${#vpath} -gt 4096 ]; then
+        log_warn "nm_register_rule_with_susfs: vpath exceeds PATH_MAX"
+        return 1
+    fi
+    if [ ${#rpath} -gt 4096 ]; then
+        log_warn "nm_register_rule_with_susfs: rpath exceeds PATH_MAX"
+        return 1
+    fi
+
     log_info "Registering: $vpath"
 
     # Step 1: Apply VFS redirect (NoMount kernel)
