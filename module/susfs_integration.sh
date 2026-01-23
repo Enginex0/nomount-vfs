@@ -416,11 +416,15 @@ susfs_apply_maps() {
 
 # ============================================================
 # FUNCTION: Apply SUSFS kstat spoofing
+# Args: vpath metadata [rpath]
+# If rpath provided, uses add_sus_kstat_redirect (both paths)
+# Otherwise falls back to add_sus_kstat_statically (original API)
 # ============================================================
 susfs_apply_kstat() {
     local vpath="$1"
     local metadata="$2"
-    log_func_enter "susfs_apply_kstat" "$vpath" "metadata_len=${#metadata}"
+    local rpath="$3"  # Optional: real path for redirect API
+    log_func_enter "susfs_apply_kstat" "$vpath" "metadata_len=${#metadata}" "rpath=$rpath"
 
     if [ "$HAS_SUSFS" != "1" ]; then
         log_debug "SUSFS not available, skipping"
@@ -489,22 +493,33 @@ EOF
         log_debug "Parsed: ino=$ino dev=$dev nlink=$nlink size=$size"
     fi
 
-    # Apply kstat spoofing
-    log_susfs_cmd "add_sus_kstat_statically" "$vpath ino=$ino dev=$dev"
-    local result rc
-    result=$("$SUSFS_BIN" add_sus_kstat_statically "$vpath" \
-        "$ino" "$dev" "$nlink" "$size" \
-        "$atime" 0 "$mtime" 0 "$ctime" 0 \
-        "$blocks" "$blksize" 2>&1)
-    rc=$?
-    log_susfs_result "$rc" "add_sus_kstat_statically" "$vpath"
+    # Apply kstat spoofing - use redirect API if rpath provided
+    local result rc cmd
+    if [ -n "$rpath" ]; then
+        cmd="add_sus_kstat_redirect"
+        log_susfs_cmd "$cmd" "$vpath $rpath ino=$ino dev=$dev"
+        result=$("$SUSFS_BIN" "$cmd" "$vpath" "$rpath" \
+            "$ino" "$dev" "$nlink" "$size" \
+            "$atime" 0 "$mtime" 0 "$ctime" 0 \
+            "$blocks" "$blksize" 2>&1)
+        rc=$?
+    else
+        cmd="add_sus_kstat_statically"
+        log_susfs_cmd "$cmd" "$vpath ino=$ino dev=$dev"
+        result=$("$SUSFS_BIN" "$cmd" "$vpath" \
+            "$ino" "$dev" "$nlink" "$size" \
+            "$atime" 0 "$mtime" 0 "$ctime" 0 \
+            "$blocks" "$blksize" 2>&1)
+        rc=$?
+    fi
+    log_susfs_result "$rc" "$cmd" "$vpath"
 
     if [ $rc -eq 0 ]; then
         SUSFS_STATS_KSTAT=$((SUSFS_STATS_KSTAT + 1))
         log_func_exit "susfs_apply_kstat" "0"
         return 0
     else
-        log_err "sus_kstat failed for $vpath: $result"
+        log_err "$cmd failed for $vpath: $result"
         SUSFS_STATS_ERRORS=$((SUSFS_STATS_ERRORS + 1))
         log_func_exit "susfs_apply_kstat" "1"
         return 1
@@ -848,10 +863,10 @@ nm_register_rule_with_susfs() {
             susfs_apply_maps "$vpath"
         fi
 
-        # sus_kstat spoofing
+        # sus_kstat spoofing (pass rpath for redirect API)
         if echo "$actions" | grep -q "sus_kstat"; then
             log_trace "Applying sus_kstat"
-            susfs_apply_kstat "$vpath" "$metadata"
+            susfs_apply_kstat "$vpath" "$metadata" "$rpath"
         fi
 
         # Mount hiding check

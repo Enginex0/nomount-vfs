@@ -158,10 +158,10 @@ index 000000000..43ca3f0fa
 +{
 +	const char *result;
 +
-+	pr_info("nomount: normalize_path ENTER input=%s\n", path ? path : "(null)");
++	if (nomount_debug >= 2) pr_info("nomount: normalize_path ENTER input=%s\n", path ? path : "(null)");
 +
 +	if (!path) {
-+		pr_info("nomount: normalize_path EXIT null input\n");
++		if (nomount_debug >= 2) pr_info("nomount: normalize_path EXIT null input\n");
 +		return NULL;
 +	}
 +
@@ -174,19 +174,19 @@ index 000000000..43ca3f0fa
 +	 */
 +	if (strncmp(path, "/system/etc/", 12) == 0) {
 +		result = path + 7;  /* Skip "/system" prefix, keep "/etc/..." */
-+		pr_info("nomount: normalize_path BRANCH system_etc_prefix: %s -> %s\n", path, result);
++		if (nomount_debug >= 2) pr_info("nomount: normalize_path BRANCH system_etc_prefix: %s -> %s\n", path, result);
 +		return result;
 +	}
 +
 +	/* Handle exact match "/system/etc" (without trailing slash or content) */
 +	if (strcmp(path, "/system/etc") == 0) {
-+		pr_info("nomount: normalize_path BRANCH system_etc_exact: %s -> /etc\n", path);
++		if (nomount_debug >= 2) pr_info("nomount: normalize_path BRANCH system_etc_exact: %s -> /etc\n", path);
 +		return "/etc";
 +	}
 +
 +	/* Handle trailing slash case "/system/etc/" -> "/etc/" */
 +	if (strcmp(path, "/system/etc/") == 0) {
-+		pr_info("nomount: normalize_path BRANCH system_etc_slash: %s -> /etc/\n", path);
++		if (nomount_debug >= 2) pr_info("nomount: normalize_path BRANCH system_etc_slash: %s -> /etc/\n", path);
 +		return "/etc/";
 +	}
 +
@@ -197,7 +197,7 @@ index 000000000..43ca3f0fa
 +	 * - /product/X
 +	 * - /etc/X (already normalized)
 +	 */
-+	pr_info("nomount: normalize_path EXIT unchanged: %s\n", path);
++	if (nomount_debug >= 2) pr_info("nomount: normalize_path EXIT unchanged: %s\n", path);
 +	return path;
 +}
 +
@@ -399,16 +399,16 @@ index 000000000..43ca3f0fa
 +	dev_t result;
 +	const char *matched = NULL;
 +
-+	pr_info("nomount: [GET_PART_DEV_FOR_PATH] ENTER path=%s\n", path ? path : "(null)");
++	if (nomount_debug >= 2) pr_info("nomount: [GET_PART_DEV_FOR_PATH] ENTER path=%s\n", path ? path : "(null)");
 +
 +	if (!path || path[0] != '/') {
-+		pr_info("nomount: [GET_PART_DEV_FOR_PATH] invalid path -> 0\n");
++		if (nomount_debug >= 2) pr_info("nomount: [GET_PART_DEV_FOR_PATH] invalid path -> 0\n");
 +		return 0;
 +	}
 +
 +	/* Lazy initialization: ensure partition device cache is populated */
 +	if (nm_partition_devs[NM_PART_SYSTEM] == 0 && nm_system_dev == 0) {
-+		pr_info("nomount: [GET_PART_DEV_FOR_PATH] partition cache empty, initializing...\n");
++		if (nomount_debug >= 2) pr_info("nomount: [GET_PART_DEV_FOR_PATH] partition cache empty, initializing...\n");
 +		nomount_init_partition_devs();
 +	}
 +
@@ -429,11 +429,11 @@ index 000000000..43ca3f0fa
 +		/* /etc is symlink to /system/etc on Android - map to system partition */
 +		result = nm_partition_devs[NM_PART_SYSTEM]; matched = "/etc/";
 +	} else {
-+		pr_info("nomount: [GET_PART_DEV_FOR_PATH] NO_MATCH path=%s -> 0\n", path);
++		if (nomount_debug >= 2) pr_info("nomount: [GET_PART_DEV_FOR_PATH] NO_MATCH path=%s -> 0\n", path);
 +		return 0;
 +	}
 +
-+	pr_info("nomount: [GET_PART_DEV_FOR_PATH] MATCHED prefix=%s path=%s -> dev=%u:%u\n",
++	if (nomount_debug >= 2) pr_info("nomount: [GET_PART_DEV_FOR_PATH] MATCHED prefix=%s path=%s -> dev=%u:%u\n",
 +		matched, path, MAJOR(result), MINOR(result));
 +	return result;
 +}
@@ -801,30 +801,30 @@ index 000000000..43ca3f0fa
 +	struct path path;
 +	int count = 0;
 +
-+	pr_info("nomount: [INIT_PART_DEVS] starting partition device cache\n");
++	if (nomount_debug >= 2) pr_info("nomount: [INIT_PART_DEVS] starting partition device cache\n");
 +	NM_DBG("init_partition_devs: starting partition device cache\n");
 +
 +	if (nm_system_dev == 0 && kern_path("/system", LOOKUP_FOLLOW, &path) == 0) {
 +		nm_system_dev = path.dentry->d_sb->s_dev;
 +		path_put(&path);
-+		pr_info("nomount: [INIT_PART_DEVS] /system -> dev=%u:%u\n",
++		if (nomount_debug >= 2) pr_info("nomount: [INIT_PART_DEVS] /system -> dev=%u:%u\n",
 +			MAJOR(nm_system_dev), MINOR(nm_system_dev));
 +		NM_DBG("init_partition_devs: /system -> dev=%u\n", nm_system_dev);
 +		count++;
 +	} else {
-+		pr_info("nomount: [INIT_PART_DEVS] /system NOT FOUND or already cached\n");
++		if (nomount_debug >= 2) pr_info("nomount: [INIT_PART_DEVS] /system NOT FOUND or already cached\n");
 +	}
 +	if (nm_vendor_dev == 0 && kern_path("/vendor", LOOKUP_FOLLOW, &path) == 0) {
 +		nm_vendor_dev = path.dentry->d_sb->s_dev;
 +		path_put(&path);
-+		pr_info("nomount: [INIT_PART_DEVS] /vendor -> dev=%u:%u\n",
++		if (nomount_debug >= 2) pr_info("nomount: [INIT_PART_DEVS] /vendor -> dev=%u:%u\n",
 +			MAJOR(nm_vendor_dev), MINOR(nm_vendor_dev));
 +		count++;
 +	}
 +	if (nm_product_dev == 0 && kern_path("/product", LOOKUP_FOLLOW, &path) == 0) {
 +		nm_product_dev = path.dentry->d_sb->s_dev;
 +		path_put(&path);
-+		pr_info("nomount: [INIT_PART_DEVS] /product -> dev=%u:%u\n",
++		if (nomount_debug >= 2) pr_info("nomount: [INIT_PART_DEVS] /product -> dev=%u:%u\n",
 +			MAJOR(nm_product_dev), MINOR(nm_product_dev));
 +		count++;
 +	}
@@ -868,14 +868,14 @@ index 000000000..43ca3f0fa
 +	if (nm_vendor_dlkm_dev == 0 && kern_path("/vendor_dlkm", LOOKUP_FOLLOW, &path) == 0) {
 +		nm_vendor_dlkm_dev = path.dentry->d_sb->s_dev;
 +		path_put(&path);
-+		pr_info("nomount: [INIT_PART_DEVS] /vendor_dlkm -> dev=%u:%u\n",
++		if (nomount_debug >= 2) pr_info("nomount: [INIT_PART_DEVS] /vendor_dlkm -> dev=%u:%u\n",
 +			MAJOR(nm_vendor_dlkm_dev), MINOR(nm_vendor_dlkm_dev));
 +		NM_DBG("init_partition_devs: /vendor_dlkm -> dev=%u\n", nm_vendor_dlkm_dev);
 +		count++;
 +	}
 +
-+	pr_info("nomount: [INIT_PART_DEVS] COMPLETE cached %d partition device IDs\n", count);
-+	pr_info("nomount: [INIT_PART_DEVS] SUMMARY: system=%u vendor=%u product=%u odm=%u system_ext=%u\n",
++	if (nomount_debug >= 2) pr_info("nomount: [INIT_PART_DEVS] COMPLETE cached %d partition device IDs\n", count);
++	if (nomount_debug >= 2) pr_info("nomount: [INIT_PART_DEVS] SUMMARY: system=%u vendor=%u product=%u odm=%u system_ext=%u\n",
 +		nm_system_dev, nm_vendor_dev, nm_product_dev, nm_odm_dev, nm_system_ext_dev);
 +	NM_INFO("init_partition_devs: cached %d partition device IDs\n", count);
 +
@@ -898,7 +898,7 @@ index 000000000..43ca3f0fa
 +	nm_partition_devs[NM_PART_SYSTEM_DLKM] = nm_system_dlkm_dev;
 +	nm_partition_devs[NM_PART_VENDOR_DLKM] = nm_vendor_dlkm_dev;
 +
-+	pr_info("nomount: [INIT_PART_DEVS] nm_partition_devs[] synced: [0]=%u [1]=%u [2]=%u\n",
++	if (nomount_debug >= 2) pr_info("nomount: [INIT_PART_DEVS] nm_partition_devs[] synced: [0]=%u [1]=%u [2]=%u\n",
 +		nm_partition_devs[0], nm_partition_devs[1], nm_partition_devs[2]);
 +}
 +
@@ -908,10 +908,10 @@ index 000000000..43ca3f0fa
 +	dev_t result;
 +	const char *matched_prefix = "default_system";
 +
-+	pr_info("nomount: [GET_PART_DEV] ENTER vpath=%s\n", virtual_path ? virtual_path : "(null)");
++	if (nomount_debug >= 2) pr_info("nomount: [GET_PART_DEV] ENTER vpath=%s\n", virtual_path ? virtual_path : "(null)");
 +
 +	if (!virtual_path) {
-+		pr_info("nomount: [GET_PART_DEV] null path -> default system=%u\n", nm_system_dev);
++		if (nomount_debug >= 2) pr_info("nomount: [GET_PART_DEV] null path -> default system=%u\n", nm_system_dev);
 +		return nm_system_dev;
 +	}
 +
@@ -956,12 +956,12 @@ index 000000000..43ca3f0fa
 +	}
 +
 +	/* Default to system for any other partition */
-+	pr_info("nomount: [GET_PART_DEV] NO_MATCH vpath=%s -> default system=%u\n",
++	if (nomount_debug >= 2) pr_info("nomount: [GET_PART_DEV] NO_MATCH vpath=%s -> default system=%u\n",
 +		virtual_path, nm_system_dev);
 +	return nm_system_dev;
 +
 +found:
-+	pr_info("nomount: [GET_PART_DEV] MATCHED prefix=%s vpath=%s -> dev=%u:%u\n",
++	if (nomount_debug >= 2) pr_info("nomount: [GET_PART_DEV] MATCHED prefix=%s vpath=%s -> dev=%u:%u\n",
 +		matched_prefix, virtual_path, MAJOR(result), MINOR(result));
 +	return result;
 +}
@@ -1035,7 +1035,7 @@ index 000000000..43ca3f0fa
 +				    rule->real_ino == 0) {
 +					rule->real_ino = resolved_ino;
 +					rule->real_dev = resolved_dev;
-+					pr_info("nomount: [LAZY_RESOLVE] %s -> ino=%lu dev=%u:%u\n",
++					if (nomount_debug >= 2) pr_info("nomount: [LAZY_RESOLVE] %s -> ino=%lu dev=%u:%u\n",
 +						rpath, resolved_ino, MAJOR(resolved_dev), MINOR(resolved_dev));
 +					break;
 +				}
@@ -1052,10 +1052,10 @@ index 000000000..43ca3f0fa
 +	int bkt;
 +	bool match = false;
 +
-+	pr_info("nomount: [IS_INJECTED] ENTER inode=%p\n", inode);
++	if (nomount_debug >= 2) pr_info("nomount: [IS_INJECTED] ENTER inode=%p\n", inode);
 +
 +	if (!inode || NOMOUNT_DISABLED()) {
-+		pr_info("nomount: [IS_INJECTED] SKIP: null_inode=%d disabled=%d\n",
++		if (nomount_debug >= 2) pr_info("nomount: [IS_INJECTED] SKIP: null_inode=%d disabled=%d\n",
 +			!inode, NOMOUNT_DISABLED());
 +		NM_DBG("is_injected: early exit (null=%d disabled=%d)\n",
 +			!inode, NOMOUNT_DISABLED());
@@ -1065,7 +1065,7 @@ index 000000000..43ca3f0fa
 +	/* Try to resolve any unresolved rules before lookup */
 +	nomount_lazy_resolve_real_ino();
 +
-+	pr_info("nomount: [IS_INJECTED] checking ino=%lu dev=%u:%u\n",
++	if (nomount_debug >= 2) pr_info("nomount: [IS_INJECTED] checking ino=%lu dev=%u:%u\n",
 +		inode->i_ino, MAJOR(inode->i_sb->s_dev), MINOR(inode->i_sb->s_dev));
 +	NM_DBG("is_injected: checking ino=%lu dev=%u\n", inode->i_ino, inode->i_sb->s_dev);
 +
@@ -1074,7 +1074,7 @@ index 000000000..43ca3f0fa
 +		/* Check both inode AND device to avoid cross-filesystem collision */
 +		if (rule->real_ino != 0 && rule->real_ino == inode->i_ino &&
 +		    rule->real_dev == inode->i_sb->s_dev) {
-+			pr_info("nomount: [IS_INJECTED] MATCHED: ino=%lu dev=%u:%u -> vpath=%s\n",
++			if (nomount_debug >= 2) pr_info("nomount: [IS_INJECTED] MATCHED: ino=%lu dev=%u:%u -> vpath=%s\n",
 +				inode->i_ino, MAJOR(inode->i_sb->s_dev), MINOR(inode->i_sb->s_dev),
 +				rule->virtual_path);
 +			NM_DBG("is_injected: matched ino=%lu vpath=%s\n", inode->i_ino, rule->virtual_path);
@@ -1084,7 +1084,7 @@ index 000000000..43ca3f0fa
 +	}
 +	rcu_read_unlock();
 +
-+	pr_info("nomount: [IS_INJECTED] RESULT: ino=%lu -> %s\n",
++	if (nomount_debug >= 2) pr_info("nomount: [IS_INJECTED] RESULT: ino=%lu -> %s\n",
 +		inode->i_ino, match ? "INJECTED" : "NOT_INJECTED");
 +	NM_DBG("is_injected: ino=%lu result=%s\n", inode->i_ino, match ? "true" : "false");
 +	return match;
@@ -1507,10 +1507,10 @@ index 000000000..43ca3f0fa
 +	int i;
 +	int cached_count = 0;
 +
-+	pr_info("nomount: [INIT_STATFS] ENTER\n");
++	if (nomount_debug >= 2) pr_info("nomount: [INIT_STATFS] ENTER\n");
 +
 +	if (nm_statfs_initialized) {
-+		pr_info("nomount: [INIT_STATFS] already initialized, skipping\n");
++		if (nomount_debug >= 2) pr_info("nomount: [INIT_STATFS] already initialized, skipping\n");
 +		NM_DBG("init_partition_statfs: already initialized\n");
 +		return;
 +	}
@@ -1518,13 +1518,13 @@ index 000000000..43ca3f0fa
 +	/* Set initializing flag to bypass redirects during cache init */
 +	nm_statfs_initializing = true;
 +
-+	pr_info("nomount: [INIT_STATFS] starting statfs cache initialization\n");
++	if (nomount_debug >= 2) pr_info("nomount: [INIT_STATFS] starting statfs cache initialization\n");
 +	NM_DBG("init_partition_statfs: starting statfs cache initialization\n");
 +
 +	for (i = 0; partitions[i] != NULL && i < 17; i++) {
 +		if (kern_path(partitions[i], LOOKUP_FOLLOW, &path) == 0) {
 +			vfs_statfs(&path, &nm_cached_statfs[i]);
-+			pr_info("nomount: [INIT_STATFS] cached[%d] %s f_type=0x%lx f_bsize=%ld\n",
++			if (nomount_debug >= 2) pr_info("nomount: [INIT_STATFS] cached[%d] %s f_type=0x%lx f_bsize=%ld\n",
 +				i, partitions[i], (unsigned long)nm_cached_statfs[i].f_type,
 +				nm_cached_statfs[i].f_bsize);
 +			NM_DBG("init_partition_statfs: cached %s (fstype=0x%lx)\n",
@@ -1532,14 +1532,14 @@ index 000000000..43ca3f0fa
 +			path_put(&path);
 +			cached_count++;
 +		} else {
-+			pr_info("nomount: [INIT_STATFS] partition[%d] %s NOT FOUND\n", i, partitions[i]);
++			if (nomount_debug >= 2) pr_info("nomount: [INIT_STATFS] partition[%d] %s NOT FOUND\n", i, partitions[i]);
 +			NM_DBG("init_partition_statfs: %s not found\n", partitions[i]);
 +		}
 +	}
 +
 +	nm_statfs_initializing = false;
 +	nm_statfs_initialized = true;
-+	pr_info("nomount: [INIT_STATFS] COMPLETE cached statfs for %d partitions\n", cached_count);
++	if (nomount_debug >= 2) pr_info("nomount: [INIT_STATFS] COMPLETE cached statfs for %d partitions\n", cached_count);
 +	NM_INFO("init_partition_statfs: cached statfs for %d partitions\n", cached_count);
 +}
 +
@@ -2299,7 +2299,7 @@ index 000000000..43ca3f0fa
 +	NM_INFO("add_rule: vpath=%s rpath=%s flags=0x%x\n", v_path, r_path, data.flags);
 +
 +	/* UNCONDITIONAL DEBUG: Log rule addition details */
-+	pr_info("nomount: [ADD_RULE] ENTRY vpath=%s rpath=%s flags=0x%x uid=%u pid=%d\n",
++	if (nomount_debug >= 2) pr_info("nomount: [ADD_RULE] ENTRY vpath=%s rpath=%s flags=0x%x uid=%u pid=%d\n",
 +		v_path, r_path, data.flags, current_uid().val, current->pid);
 +
 +	/*
@@ -2313,17 +2313,17 @@ index 000000000..43ca3f0fa
 +			/* Path was normalized - need to store normalized version */
 +			char *norm_copy = kstrdup(norm_vpath, GFP_KERNEL);
 +			if (norm_copy) {
-+				pr_info("nomount: [ADD_RULE] NORMALIZED vpath: %s -> %s\n", v_path, norm_copy);
++				if (nomount_debug >= 2) pr_info("nomount: [ADD_RULE] NORMALIZED vpath: %s -> %s\n", v_path, norm_copy);
 +				kfree(v_path);
 +				v_path = norm_copy;
 +			} else {
-+				pr_info("nomount: [ADD_RULE] WARNING: kstrdup failed for normalized path, using original\n");
++				if (nomount_debug >= 2) pr_info("nomount: [ADD_RULE] WARNING: kstrdup failed for normalized path, using original\n");
 +			}
 +		}
 +	}
 +
 +	hash = full_name_hash(NULL, v_path, strlen(v_path));
-+	pr_info("nomount: [ADD_RULE] vpath_hash=0x%08x (normalized vpath=%s)\n", hash, v_path);
++	if (nomount_debug >= 2) pr_info("nomount: [ADD_RULE] vpath_hash=0x%08x (normalized vpath=%s)\n", hash, v_path);
 +	rule = kzalloc(sizeof(*rule), GFP_KERNEL);
 +	if (!rule) {
 +		NM_ERR("add_rule: failed to allocate rule struct\n");
@@ -2348,37 +2348,37 @@ index 000000000..43ca3f0fa
 +			rule->real_dev = path.dentry->d_sb->s_dev;
 +			NM_DBG("add_rule: real_ino=%lu real_dev=%u\n",
 +			       rule->real_ino, rule->real_dev);
-+			pr_info("nomount: [ADD_RULE] real_path resolved: ino=%lu dev=%u:%u\n",
++			if (nomount_debug >= 2) pr_info("nomount: [ADD_RULE] real_path resolved: ino=%lu dev=%u:%u\n",
 +				rule->real_ino, MAJOR(rule->real_dev), MINOR(rule->real_dev));
 +		}
 +		path_put(&path);
 +	} else {
 +		NM_ERR("add_rule: kern_path failed for %s (err=%d)\n", r_path, ret);
-+		pr_info("nomount: [ADD_RULE] real_path FAILED to resolve: %s err=%d\n", r_path, ret);
++		if (nomount_debug >= 2) pr_info("nomount: [ADD_RULE] real_path FAILED to resolve: %s err=%d\n", r_path, ret);
 +		rule->real_ino = 0;
 +		rule->real_dev = 0;
 +	}
 +
 +	rule->virtual_ino = full_name_hash(NULL, v_path, strlen(v_path));
 +	NM_DBG("add_rule: virtual_ino=%lu hash=%u\n", rule->virtual_ino, hash);
-+	pr_info("nomount: [ADD_RULE] virtual_ino=%lu vpath_hash=0x%08x\n", rule->virtual_ino, hash);
++	if (nomount_debug >= 2) pr_info("nomount: [ADD_RULE] virtual_ino=%lu vpath_hash=0x%08x\n", rule->virtual_ino, hash);
 +
 +	/* Cache partition metadata from virtual path for statfs spoofing */
-+	pr_info("nomount: [ADD_RULE] caching partition metadata for vpath=%s\n", v_path);
++	if (nomount_debug >= 2) pr_info("nomount: [ADD_RULE] caching partition metadata for vpath=%s\n", v_path);
 +	nomount_cache_partition_metadata(rule);
-+	pr_info("nomount: [ADD_RULE] cached_partition_dev=%u:%u\n",
++	if (nomount_debug >= 2) pr_info("nomount: [ADD_RULE] cached_partition_dev=%u:%u\n",
 +		MAJOR(rule->cached_partition_dev), MINOR(rule->cached_partition_dev));
 +
 +	spin_lock(&nomount_lock);
 +	{
 +		u32 rpath_hash = nomount_hash_path(r_path);
-+		pr_info("nomount: [ADD_RULE] rpath_hash=0x%08x (for targets_ht)\n", rpath_hash);
++		if (nomount_debug >= 2) pr_info("nomount: [ADD_RULE] rpath_hash=0x%08x (for targets_ht)\n", rpath_hash);
 +		hash_add_rcu(nomount_rules_ht, &rule->node, hash);
 +		hash_add_rcu(nomount_targets_ht, &rule->target_node, rpath_hash);  /* Reverse lookup */
 +	}
 +	list_add_tail(&rule->list, &nomount_rules_list);
 +	spin_unlock(&nomount_lock);
-+	pr_info("nomount: [ADD_RULE] rule added to hash tables and list\n");
++	if (nomount_debug >= 2) pr_info("nomount: [ADD_RULE] rule added to hash tables and list\n");
 +
 +	/* Mark parent directory for O(1) hide check optimization */
 +	nomount_mark_parent_has_hidden(v_path);
@@ -2395,7 +2395,7 @@ index 000000000..43ca3f0fa
 +	nomount_force_refresh_all();
 +
 +	NM_INFO("add_rule: success vpath=%s -> rpath=%s\n", v_path, r_path);
-+	pr_info("nomount: [ADD_RULE] SUCCESS vpath=%s rpath=%s cached_dev=%u:%u\n",
++	if (nomount_debug >= 2) pr_info("nomount: [ADD_RULE] SUCCESS vpath=%s rpath=%s cached_dev=%u:%u\n",
 +		v_path, r_path, MAJOR(rule->cached_partition_dev), MINOR(rule->cached_partition_dev));
 +	return 0;
 +}
