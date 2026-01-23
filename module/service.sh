@@ -1286,6 +1286,17 @@ save_rule_cache() {
                 fi
             fi
 
+            # Check 3: Skip marker files
+            if [ "$include_rule" = "1" ]; then
+                case "${rpath##*/}" in
+                    .replace|.remove|.gitkeep|.nomedia|.placeholder)
+                        log_debug "FILTERED: marker file - $vpath"
+                        include_rule=0
+                        echo "FILTER" >> "$filter_count_file"
+                        ;;
+                esac
+            fi
+
             # Only save valid rules
             if [ "$include_rule" = "1" ]; then
                 [ -n "$vpath" ] && [ -n "$rpath" ] && echo "add|$vpath|$rpath" >> "$temp_file"
