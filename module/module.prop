@@ -1,7 +1,7 @@
 id=nomount
 metamodule=true
 name=NoMount VFS
-version=v0.8.2
-versionCode=12
+version=v0.8.3
+versionCode=13
 author=maxsteeel, Enginex0
 description=Zero-mount-footprint file injection via VFS path redirection. Dynamic statfs/stat spoofing. Supports KernelSU, APatch, and Magisk.
