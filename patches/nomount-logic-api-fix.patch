@@ -1,0 +1,19 @@
+--- a/fs/vfs_dcache.c
++++ b/fs/vfs_dcache.c
+@@ -1944,7 +1944,7 @@ static int nomount_inject_dents64(struct file *file, struct dir_context *ctx)
+ 	dir_path = d_path(&file->f_path, page_buf, PAGE_SIZE);
+ 	if (IS_ERR(dir_path)) {
+ 		NM_DBG("inject_dents64: d_path failed (err=%ld)\n", PTR_ERR(dir_path));
+-		free_page((unsigned long)page_buf);
++		__putname(page_buf);  /* Correct API for __getname() */
+ 		return;
+ 	}
+
+@@ -2020,7 +2020,7 @@ static int nomount_inject_dents(struct file *file, struct dir_context *ctx)
+ 	dir_path = d_path(&file->f_path, page_buf, PAGE_SIZE);
+ 	if (IS_ERR(dir_path)) {
+ 		NM_DBG("inject_dents: d_path failed (err=%ld)\n", PTR_ERR(dir_path));
+-		free_page((unsigned long)page_buf);
++		__putname(page_buf);  /* Correct API for __getname() */
+ 		return;
+ 	}
