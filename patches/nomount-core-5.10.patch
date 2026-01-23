@@ -1000,6 +1000,53 @@ index 000000000..43ca3f0fa
 +}
 +EXPORT_SYMBOL(nomount_is_traversal_allowed);
 +
++/*
++ * Lazy resolution for rules where kern_path() failed during early-boot registration.
++ * MUST be called OUTSIDE any RCU critical section - kern_path() can sleep.
++ * Processes at most one rule per call to avoid blocking.
++ */
++static void nomount_lazy_resolve_real_ino(void)
++{
++	struct nomount_rule *rule;
++	struct path path;
++	char *rpath = NULL;
++	int bkt;
++
++	rcu_read_lock();
++	hash_for_each_rcu(nomount_rules_ht, bkt, rule, node) {
++		if (rule->real_ino == 0 && rule->real_path) {
++			rpath = kstrdup(rule->real_path, GFP_ATOMIC);
++			break;
++		}
++	}
++	rcu_read_unlock();
++
++	if (!rpath)
++		return;
++
++	if (kern_path(rpath, LOOKUP_FOLLOW, &path) == 0) {
++		if (path.dentry && d_backing_inode(path.dentry)) {
++			ino_t resolved_ino = d_backing_inode(path.dentry)->i_ino;
++			dev_t resolved_dev = path.dentry->d_sb->s_dev;
++
++			spin_lock(&nomount_lock);
++			hash_for_each_rcu(nomount_rules_ht, bkt, rule, node) {
++				if (rule->real_path && strcmp(rule->real_path, rpath) == 0 &&
++				    rule->real_ino == 0) {
++					rule->real_ino = resolved_ino;
++					rule->real_dev = resolved_dev;
++					pr_info("nomount: [LAZY_RESOLVE] %s -> ino=%lu dev=%u:%u\n",
++						rpath, resolved_ino, MAJOR(resolved_dev), MINOR(resolved_dev));
++					break;
++				}
++			}
++			spin_unlock(&nomount_lock);
++		}
++		path_put(&path);
++	}
++	kfree(rpath);
++}
++
 +bool nomount_is_injected_file(struct inode *inode) {
 +	struct nomount_rule *rule;
 +	int bkt;
@@ -1014,6 +1061,9 @@ index 000000000..43ca3f0fa
 +			!inode, NOMOUNT_DISABLED());
 +		return false;
 +	}
++
++	/* Try to resolve any unresolved rules before lookup */
++	nomount_lazy_resolve_real_ino();
 +
 +	pr_info("nomount: [IS_INJECTED] checking ino=%lu dev=%u:%u\n",
 +		inode->i_ino, MAJOR(inode->i_sb->s_dev), MINOR(inode->i_sb->s_dev));
@@ -1070,7 +1120,8 @@ index 000000000..43ca3f0fa
 +		return;
 +	}
 +
-+	NOMOUNT_HOOK_ENTER();  /* Recursion guard - prevents stat->vfs_getattr->stat loop */
++	/* Try to resolve any unresolved rules */
++	nomount_lazy_resolve_real_ino();
 +
 +	pr_info("nomount: [SPOOF_STAT] checking ino=%lu dev=%u:%u\n",
 +		inode->i_ino, MAJOR(inode->i_sb->s_dev), MINOR(inode->i_sb->s_dev));
@@ -1137,7 +1188,6 @@ index 000000000..43ca3f0fa
 +			inode->i_ino, inode->i_sb->s_dev);
 +	}
 +	pr_info("nomount: [SPOOF_STAT] EXIT\n");
-+	NOMOUNT_HOOK_EXIT();  /* Recursion guard */
 +}
 +EXPORT_SYMBOL(nomount_spoof_stat);
 +
