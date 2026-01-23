@@ -166,11 +166,135 @@ inject_vfs_getattr_nosec_hook() {
 }
 
 # ============================================================================
+# INJECTION 4: Syscall-level hook in SYSCALL_DEFINE4(newfstatat)
+# This is the cleanest hook point - after VFS, before userspace copy
+# ============================================================================
+inject_syscall_newfstatat_hook() {
+    local marker="nomount_syscall_spoof_stat"
+
+    if grep -q "$marker" "$TARGET"; then
+        info "newfstatat syscall hook already injected, skipping."
+        return 0
+    fi
+
+    # Anchor: return cp_new_stat(&stat, statbuf);
+    # This appears in SYSCALL_DEFINE4(newfstatat)
+    if ! grep -q 'return cp_new_stat(&stat, statbuf);' "$TARGET"; then
+        warn "Anchor 'return cp_new_stat(&stat, statbuf);' not found - may be different kernel version"
+        return 0
+    fi
+
+    info "Injecting newfstatat syscall hook..."
+
+    # Use awk for precise replacement - handles the return statement
+    awk '
+    /return cp_new_stat\(&stat, statbuf\);/ && !done_newfstatat {
+        print "#ifdef CONFIG_FS_DCACHE_PREFETCH"
+        print "\tnomount_syscall_spoof_stat(dfd, filename, &stat);"
+        print "#endif"
+        print $0
+        done_newfstatat = 1
+        next
+    }
+    { print }
+    ' "$TARGET" > "${TARGET}.tmp" && mv "${TARGET}.tmp" "$TARGET"
+
+    # Verify
+    if ! grep -q "$marker" "$TARGET"; then
+        error "Failed to inject newfstatat syscall hook"
+    fi
+
+    info "newfstatat syscall hook injected successfully."
+}
+
+# ============================================================================
+# INJECTION 5: Syscall-level hook in COMPAT_SYSCALL_DEFINE4(newfstatat)
+# 32-bit compatibility syscall
+# ============================================================================
+inject_compat_syscall_newfstatat_hook() {
+    local marker_count
+
+    # Check if compat syscall hook already injected (we need TWO occurrences of the marker)
+    marker_count=$(grep -c "nomount_syscall_spoof_stat" "$TARGET" 2>/dev/null || echo "0")
+    if [[ "$marker_count" -ge 2 ]]; then
+        info "compat newfstatat syscall hook already injected, skipping."
+        return 0
+    fi
+
+    # Anchor: return cp_compat_stat(&stat, statbuf);
+    # This appears in COMPAT_SYSCALL_DEFINE4(newfstatat)
+    if ! grep -q 'return cp_compat_stat(&stat, statbuf);' "$TARGET"; then
+        warn "Anchor 'return cp_compat_stat(&stat, statbuf);' not found - may be different kernel version"
+        return 0
+    fi
+
+    info "Injecting compat newfstatat syscall hook..."
+
+    # Use awk for precise replacement
+    awk '
+    /return cp_compat_stat\(&stat, statbuf\);/ && !done_compat {
+        print "#ifdef CONFIG_FS_DCACHE_PREFETCH"
+        print "\tnomount_syscall_spoof_stat(dfd, filename, &stat);"
+        print "#endif"
+        print $0
+        done_compat = 1
+        next
+    }
+    { print }
+    ' "$TARGET" > "${TARGET}.tmp" && mv "${TARGET}.tmp" "$TARGET"
+
+    # Verify - should now have 2 occurrences
+    marker_count=$(grep -c "nomount_syscall_spoof_stat" "$TARGET" 2>/dev/null || echo "0")
+    if [[ "$marker_count" -lt 2 ]]; then
+        warn "compat newfstatat hook may not have been injected correctly"
+    else
+        info "compat newfstatat syscall hook injected successfully."
+    fi
+}
+
+# ============================================================================
+# INJECTION 6: Syscall-level hook in SYSCALL_DEFINE4(fstatat64)
+# Some kernels use fstatat64 instead of newfstatat for 64-bit stat
+# ============================================================================
+inject_syscall_fstatat64_hook() {
+    # Anchor: return cp_new_stat64(&stat, statbuf);
+    if ! grep -q 'return cp_new_stat64(&stat, statbuf);' "$TARGET"; then
+        info "fstatat64 syscall not found (normal for some kernel versions), skipping."
+        return 0
+    fi
+
+    # Check if already injected near cp_new_stat64
+    if grep -B2 'return cp_new_stat64(&stat, statbuf);' "$TARGET" | grep -q "nomount_syscall_spoof_stat"; then
+        info "fstatat64 syscall hook already injected, skipping."
+        return 0
+    fi
+
+    info "Injecting fstatat64 syscall hook..."
+
+    awk '
+    /return cp_new_stat64\(&stat, statbuf\);/ && !done_fstatat64 {
+        print "#ifdef CONFIG_FS_DCACHE_PREFETCH"
+        print "\tnomount_syscall_spoof_stat(dfd, filename, &stat);"
+        print "#endif"
+        print $0
+        done_fstatat64 = 1
+        next
+    }
+    { print }
+    ' "$TARGET" > "${TARGET}.tmp" && mv "${TARGET}.tmp" "$TARGET"
+
+    info "fstatat64 syscall hook injected successfully."
+}
+
+# ============================================================================
 # Main execution
 # ============================================================================
 inject_include
 inject_generic_fillattr_hook
 inject_vfs_getattr_nosec_hook
+inject_syscall_newfstatat_hook
+inject_compat_syscall_newfstatat_hook
+inject_syscall_fstatat64_hook
 
 info "All NoMount stat hooks injected successfully into $TARGET"
 exit 0

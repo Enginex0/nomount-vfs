@@ -1362,6 +1362,75 @@ index 000000000..43ca3f0fa
 +EXPORT_SYMBOL(vfs_dcache_spoof_stat_dev);
 +
 +/*
++ * Syscall-level stat spoofing - called from newfstatat syscall
++ * AFTER vfs_fstatat() but BEFORE cp_new_stat()
++ *
++ * This is the cleanest hook point: syscall entry/exit is the boundary
++ * where we have final say before userspace sees the stat result.
++ *
++ * @dfd: Directory file descriptor (AT_FDCWD for cwd-relative)
++ * @filename: Userspace path pointer
++ * @stat: Kernel stat struct to potentially modify
++ */
++void nomount_syscall_spoof_stat(int dfd, const char __user *filename, struct kstat *stat)
++{
++	char pathbuf[256];
++	struct nomount_rule *rule;
++	const char *norm_path;
++	dev_t expected_dev = 0;
++	long len;
++	u32 hash;
++
++	if (NOMOUNT_DISABLED())
++		return;
++
++	if (nomount_is_critical_process())
++		return;
++
++	if (nomount_is_uid_blocked(current_uid().val))
++		return;
++
++	len = strncpy_from_user(pathbuf, filename, sizeof(pathbuf));
++	if (len <= 0 || len >= sizeof(pathbuf))
++		return;
++
++	/* Only process absolute paths or AT_FDCWD relative paths starting with / */
++	if (pathbuf[0] != '/')
++		return;
++
++	/* Ensure partition cache is initialized BEFORE entering RCU (kern_path sleeps) */
++	if (nm_partition_devs[NM_PART_SYSTEM] == 0 && nm_system_dev == 0)
++		nomount_init_partition_devs();
++
++	/* Phase 1: Lookup by virtual path (what user requested) */
++	norm_path = nomount_normalize_path(pathbuf);
++	hash = nomount_hash_path(norm_path);
++
++	rcu_read_lock();
++	hash_for_each_possible_rcu(nomount_rules_ht, rule, node, hash) {
++		const char *rule_norm = nomount_normalize_path(rule->virtual_path);
++		if (strcmp(rule_norm, norm_path) == 0 || strcmp(rule->virtual_path, pathbuf) == 0) {
++			expected_dev = rule->cached_partition_dev;
++			break;
++		}
++	}
++	rcu_read_unlock();
++
++	/* Phase 2: Fallback to prefix-based lookup (OUTSIDE RCU - can sleep) */
++	if (expected_dev == 0) {
++		expected_dev = nomount_get_partition_dev_for_path(pathbuf);
++	}
++
++	if (expected_dev != 0 && stat->dev != expected_dev) {
++		pr_info("nomount: [SYSCALL_SPOOF] SPOOFING %s dev %u:%u->%u:%u\n",
++			pathbuf, MAJOR(stat->dev), MINOR(stat->dev),
++			MAJOR(expected_dev), MINOR(expected_dev));
++		stat->dev = expected_dev;
++	}
++}
++EXPORT_SYMBOL(nomount_syscall_spoof_stat);
++
++/*
 + * SELinux context spoofing for injected files
 + * Returns the expected SELinux context based on virtual path prefix
 + */
@@ -2941,6 +3010,7 @@ index 000000000..9e0fb1b21
 +#define nomount_is_mount_hidden      vfs_dcache_is_mnt_hidden
 +#define nm_partition_devs            vfs_dcache_part_devs
 +#define nomount_spoof_stat_dev       vfs_dcache_spoof_dev
++#define nomount_syscall_spoof_stat   vfs_dcache_syscall_spoof
 +#define nomount_maps_patterns_ht     vfs_dcache_maps_ht
 +#define nomount_should_hide_map      vfs_dcache_hide_map
 +
@@ -3084,6 +3154,7 @@ index 000000000..9e0fb1b21
 +bool nomount_is_injected_file(struct inode *inode);
 +void nomount_spoof_stat(struct inode *inode, struct kstat *stat);
 +void vfs_dcache_spoof_stat_dev(const char *path, struct kstat *stat);
++void nomount_syscall_spoof_stat(int dfd, const char __user *filename, struct kstat *stat);
 +const char *nomount_get_spoofed_selinux_context(struct inode *inode);
 +int nomount_spoof_statfs(struct inode *inode, struct kstatfs *buf);
 +bool vfs_dcache_is_mount_hidden(int mount_id);
@@ -3101,6 +3172,7 @@ index 000000000..9e0fb1b21
 +static inline bool nomount_is_injected_file(struct inode *inode) { return false; }
 +static inline void nomount_spoof_stat(struct inode *inode, struct kstat *stat) {}
 +static inline void vfs_dcache_spoof_stat_dev(const char *path, struct kstat *stat) {}
++static inline void nomount_syscall_spoof_stat(int dfd, const char __user *filename, struct kstat *stat) {}
 +static inline const char *nomount_get_spoofed_selinux_context(struct inode *inode) { return NULL; }
 +static inline int nomount_spoof_statfs(struct inode *inode, struct kstatfs *buf) { return -EINVAL; }
 +static inline bool vfs_dcache_is_mount_hidden(int mount_id) { return false; }
