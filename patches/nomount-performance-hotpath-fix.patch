@@ -1,0 +1,126 @@
+--- a/fs/vfs_dcache.c
++++ b/fs/vfs_dcache.c
+@@ -977,7 +977,7 @@ bool nomount_is_injected_file(struct inode *inode) {
+ 	int bkt;
+ 	bool match = false;
+
+-	pr_info("nomount: [IS_INJECTED] ENTER inode=%p\n", inode);
++	NM_DBG("is_injected: enter inode=%p\n", inode);
+
+ 	if (!inode || !inode->i_sb || NOMOUNT_DISABLED()) {
+-		pr_info("nomount: [IS_INJECTED] SKIP: null_inode=%d disabled=%d\n",
+-			!inode, NOMOUNT_DISABLED());
+ 		NM_DBG("is_injected: early exit (null=%d disabled=%d)\n",
+ 			!inode, NOMOUNT_DISABLED());
+ 		return false;
+ 	}
+
+-	/* Try to resolve any unresolved rules before lookup */
+-	nomount_lazy_resolve_real_ino();
+-
+ 	if (nomount_is_uid_blocked(current_uid().val)) return NULL;
+ 	NOMOUNT_HOOK_ENTER_RET(NULL);
+
+-	pr_info("nomount: [IS_INJECTED] checking ino=%lu dev=%u:%u\n",
+-		inode->i_ino, MAJOR(inode->i_sb->s_dev), MINOR(inode->i_sb->s_dev));
++	NM_DBG("is_injected: checking ino=%lu dev=%u\n", inode->i_ino, inode->i_sb->s_dev);
+
+ 	rcu_read_lock();
+ 	hash_for_each_rcu(nomount_rules_ht, bkt, rule, node) {
+@@ -1002,8 +999,7 @@ bool nomount_is_injected_file(struct inode *inode) {
+ 		if (rule->real_ino != 0 && rule->real_ino == inode->i_ino &&
+ 		    rule->real_dev == inode->i_sb->s_dev) {
+-			pr_info("nomount: [IS_INJECTED] MATCHED: ino=%lu dev=%u:%u -> vpath=%s\n",
+-				inode->i_ino, MAJOR(inode->i_sb->s_dev), MINOR(inode->i_sb->s_dev),
+-				rule->virtual_path);
++			NM_DBG("is_injected: matched ino=%lu vpath=%s\n", inode->i_ino, rule->virtual_path);
+ 			match = true;
+ 			break;
+ 		}
+@@ -1012,8 +1008,7 @@ bool nomount_is_injected_file(struct inode *inode) {
+ 	rcu_read_unlock();
+
+-	pr_info("nomount: [IS_INJECTED] RESULT: ino=%lu -> %s\n",
+-		inode->i_ino, match ? "INJECTED" : "NOT_INJECTED");
++	NM_DBG("is_injected: result=%s\n", match ? "true" : "false");
+ 	return match;
+ }
+
+@@ -1027,11 +1022,11 @@ void nomount_spoof_stat(struct inode *inode, struct kstat *stat)
+ 	char *vpath_copy = NULL;
+ 	bool matched = false;
+
+-	pr_info("nomount: [SPOOF_STAT] ENTER inode=%p stat=%p\n", inode, stat);
++	NM_DBG("spoof_stat: enter ino=%lu\n", inode ? inode->i_ino : 0);
+
+ 	if (nomount_is_critical_process()) {
+-		pr_info("nomount: [SPOOF_STAT] SKIP: critical process\n");
++		NM_DBG("spoof_stat: skip critical process\n");
+ 		return;
+ 	}
+
+ 	if (!inode || !inode->i_sb || NOMOUNT_DISABLED()) {
+-		pr_info("nomount: [SPOOF_STAT] SKIP: null_inode=%d disabled=%d\n",
+-			!inode, NOMOUNT_DISABLED());
++		NM_DBG("spoof_stat: skip null=%d disabled=%d\n", !inode, NOMOUNT_DISABLED());
+ 		return;
+ 	}
+
+ 	if (nomount_is_uid_blocked(current_uid().val)) {
+-		pr_info("nomount: [SPOOF_STAT] SKIP: uid=%u blocked\n", current_uid().val);
++		NM_DBG("spoof_stat: skip uid=%u blocked\n", current_uid().val);
+ 		return;
+ 	}
+
+-	pr_info("nomount: [SPOOF_STAT] checking ino=%lu dev=%u:%u\n",
+-		inode->i_ino, MAJOR(inode->i_sb->s_dev), MINOR(inode->i_sb->s_dev));
++	NM_DBG("spoof_stat: checking ino=%lu\n", inode->i_ino);
+
+ 	if (nm_system_dev == 0) {
+-		pr_info("nomount: [SPOOF_STAT] nm_system_dev=0, initializing partition devs\n");
++		NM_DBG("spoof_stat: initializing partition devs\n");
+ 		nomount_init_partition_devs();
+ 	}
+
+@@ -1066,15 +1061,13 @@ void nomount_spoof_stat(struct inode *inode, struct kstat *stat)
+ 		if (rule->real_ino != 0 && rule->real_ino == inode->i_ino &&
+ 		    rule->real_dev == inode->i_sb->s_dev) {
+-			pr_info("nomount: [SPOOF_STAT] MATCHED: vpath=%s cached_dev=%u:%u\n",
+-				rule->virtual_path, MAJOR(rule->cached_partition_dev), MINOR(rule->cached_partition_dev));
++			NM_DBG("spoof_stat: matched vpath=%s\n", rule->virtual_path);
+
+ 			if (rule->cached_partition_dev == 0) {
+-				pr_info("nomount: [SPOOF_STAT] cached_dev=0, using prefix fallback\n");
++				NM_DBG("spoof_stat: using prefix fallback\n");
+ 				rule->cached_partition_dev = nomount_get_partition_dev_by_prefix(rule->virtual_path);
+ 			}
+
+@@ -1087,8 +1080,7 @@ void nomount_spoof_stat(struct inode *inode, struct kstat *stat)
+ 				dev_before = stat->dev;
+ 				ino_before = stat->ino;
+
+-				pr_info("nomount: [SPOOF_STAT] SPOOFED: dev=%u:%u->%u:%u ino=%lu->%lu\n",
+-					MAJOR(dev_before), MINOR(dev_before), MAJOR(stat->dev), MINOR(stat->dev),
+-					ino_before, stat->ino);
++				NM_DBG("spoof_stat: spoofed dev=%u->%u ino=%lu->%lu\n",
++					dev_before, stat->dev, ino_before, stat->ino);
+
+ 				vpath_copy = kstrdup(rule->virtual_path, GFP_ATOMIC);
+ 				if (!vpath_copy) {
+-					pr_info("nomount: [SPOOF_STAT] vpath_copy alloc failed, using static timestamps\n");
++					NM_DBG("spoof_stat: vpath_copy alloc failed\n");
+ 					matched = true;
+ 					break;
+ 				}
+@@ -1107,12 +1099,10 @@ void nomount_spoof_stat(struct inode *inode, struct kstat *stat)
+ 	rcu_read_unlock();
+
+ 	if (!matched) {
+-		pr_info("nomount: [SPOOF_STAT] NO_MATCH: ino=%lu dev=%u:%u\n",
+-			inode->i_ino, MAJOR(inode->i_sb->s_dev), MINOR(inode->i_sb->s_dev));
++		NM_DBG("spoof_stat: no match for ino=%lu\n", inode->i_ino);
+ 	}
+
+ 	if (vpath_copy) kfree(vpath_copy);
+-	pr_info("nomount: [SPOOF_STAT] EXIT\n");
+ }
