@@ -564,6 +564,201 @@ The file IS being redirected (content from module), but stat() shows wrong devic
 
 ---
 
+---
+
+# SESSION 2: OverlayFS Hook Attempt (2026-01-23)
+
+**Duration**: ~6 hours
+**Status**: CRITICAL LESSON LEARNED - OverlayFS hooking is BAD
+
+---
+
+## 12. Session 2 Summary
+
+### What We Attempted
+Based on the previous session's findings that OverlayFS bypasses VFS hooks, we attempted to hook OverlayFS directly by creating `inject-overlayfs-hooks.sh`.
+
+### The OverlayFS Bypass Problem (Confirmed)
+Debug logs confirmed that `vfs_getattr_nosec` hook ONLY fires for:
+- `/dev/__properties__`
+- `/proc/*` paths
+- Pipe descriptors
+
+It NEVER fires for `/system/*` or `/system/fonts/*` paths because OverlayFS has its own `ovl_getattr()` that bypasses `vfs_getattr_nosec`.
+
+### Root Cause Identified
+In `fs/overlayfs/inode.c`, the `ovl_getattr()` function calls `ovl_map_dev_ino()` which OVERWRITES `stat->dev` with the overlay's device ID, undoing any spoofing done earlier in the VFS chain.
+
+---
+
+## 13. What Was Implemented This Session
+
+### Commits Made
+```
+64429b9 feat(kernel): Implement path-based stat spoofing architecture (Phases 2-5)
+d5485ee feat(kernel): Add OverlayFS hook injection script
+23c7ac0 fix(overlayfs-hook): Use PATH-based matching instead of inode-based
+e49933d1 fix(build): Add inject-overlayfs-hooks.sh to build workflow
+```
+
+### Files Created/Modified
+
+#### NEW FILE: `patches/inject-overlayfs-hooks.sh`
+- Hooks `fs/overlayfs/inode.c` after `ovl_map_dev_ino()` returns
+- First attempt: inode-based matching via `nomount_is_injected_file()` - FAILED
+- Second attempt: path-based matching via `d_path()` + `vfs_dcache_spoof_stat_dev()`
+
+#### MODIFIED: `.github/workflows/build.yml` (in fork-nomount repo)
+- Added call to `inject-overlayfs-hooks.sh fs/overlayfs/inode.c`
+- Added validation check for `nomount_ovl_hook` marker
+
+### Why Inode-Based Matching Failed
+When the OverlayFS hook ran:
+- `ovl_dentry_real(dentry)` returned inode from LOWER layer (253:9, /mi_ext erofs)
+- But rules were registered with inode from DATA layer (253:47, /data f2fs)
+- Different inodes → `nomount_is_injected_file()` returned false → no spoofing
+
+---
+
+## 14. CRITICAL LESSON: OverlayFS Hooking is BAD
+
+### What Happened After Flashing
+After building and flashing the kernel with OverlayFS hooks:
+- **MORE detections appeared, not fewer**
+- Android system itself uses OverlayFS extensively
+- Hooking OverlayFS exposed too many system operations to detection apps
+- The hook caused more harm than good
+
+### Conclusion
+**The OverlayFS hook approach must be ABANDONED.**
+
+The next session should:
+1. **REMOVE** `inject-overlayfs-hooks.sh` from `build.yml` workflow
+2. **DISABLE or DELETE** `inject-overlayfs-hooks.sh`
+3. Find an **ALTERNATIVE** approach that doesn't hook OverlayFS
+
+---
+
+## 15. Other Bugs Discovered (Still Unfixed)
+
+### Bug 1: Partition Device Cache Shows 0:0
+```
+nomount: [SPOOF_STAT_DEV] PHASE2 result: expected_dev=0:0
+nomount: [SPOOF_STAT_DEV] REASON: expected_dev=0 (no partition match)
+```
+The `nm_partition_devs[]` array is not being populated at boot.
+
+### Bug 2: Missing `/etc/` Prefix
+`nomount_get_partition_dev_for_path()` handles `/system/`, `/vendor/`, `/product/`, `/system_ext/` but NOT `/etc/` (the normalized form of `/system/etc/`).
+
+### Bug 3: Hash Mismatch at Registration vs Lookup
+- Rules registered with: `hash("/system/etc/audio.conf")` (unnormalized)
+- Lookup uses: `hash("/etc/audio.conf")` (after normalization)
+- Different hashes → rule never found
+
+### Bug 4: vfs_dcache_spoof_stat_dev() Lookup Logic
+The function only looks up by real_path (reverse lookup), but the OverlayFS hook passes virtual_path. Need to add virtual path lookup.
+
+---
+
+## 16. Alternative Approaches to Explore
+
+Since OverlayFS hooking is bad, consider these alternatives:
+
+### Option A: HymoFS Approach (Study More Carefully)
+HymoFS hooks `vfs_getattr_nosec()` AFTER `inode->i_op->getattr()` returns. This means AFTER OverlayFS runs but WITHOUT hooking OverlayFS itself. Need to verify this works.
+
+### Option B: Syscall-Level Hooking
+Intercept `newfstatat`/`fstatat` at syscall level before VFS. SUSFS already does this for some operations.
+
+### Option C: SUSFS Integration
+Use SUSFS's `sus_kstat` feature for stat spoofing instead of NoMount's implementation.
+
+### Option D: Per-Rule Cached Device ID
+Ensure each rule stores the correct target device ID at registration time, derived from the virtual_path's partition.
+
+---
+
+## 17. Files That Need Attention
+
+### To REMOVE from build workflow:
+```yaml
+# In fork-nomount/.github/workflows/build.yml
+# REMOVE THIS LINE:
+"$NOMOUNT_VFS/patches/inject-overlayfs-hooks.sh" fs/overlayfs/inode.c
+# AND REMOVE THIS VALIDATION:
+grep -q "nomount_ovl_hook" fs/overlayfs/inode.c || { echo "FAIL..."; exit 1; }
+```
+
+### To DISABLE/DELETE:
+- `patches/inject-overlayfs-hooks.sh` - causes more detections
+
+### To FIX:
+- `nomount_get_partition_dev_for_path()` - add `/etc/` prefix
+- `nomount_ioctl_add_rule()` - normalize virtual_path before hashing
+- `vfs_dcache_spoof_stat_dev()` - add virtual path lookup
+- `nomount_init_partition_devs()` - debug why it's not populating cache
+
+---
+
+## 18. Device State Reference
+
+### Registered Rules
+- ~92 rules total
+- 20+ font rules including NotoColorEmoji.ttf
+- Rules exist for both audio files and font files
+- Rules ARE correctly registered, but spoofing doesn't happen
+
+### Font File State
+```
+/system/fonts/NotoColorEmoji.ttf
+  Device: 64815 (253:47 = /data) ← WRONG
+  Expected: 64773 (253:5 = /system)
+
+/system/fonts/Roboto-Regular.ttf (original, non-module)
+  Device: 64773 (253:5 = /system) ← CORRECT
+```
+
+### Gboard Crash Details
+```
+E OpenGLRenderer: Failed to make SkData from file name: /system/fonts/NotoColorEmoji.ttf
+F libc: Fatal signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr 0x0
+```
+Crash in `minikin::Font::prepareFont()` due to NULL pointer from failed file open.
+
+---
+
+## 19. Key Takeaways for Next Session
+
+1. **DO NOT hook OverlayFS** - it causes more detections
+2. **Study HymoFS more carefully** - their approach works without hooking OverlayFS
+3. **Fix partition device cache** - expected_dev=0:0 means no spoofing happens
+4. **Fix hash mismatch** - normalize paths consistently at registration AND lookup
+5. **Add /etc/ prefix** - normalized paths start with /etc/, not /system/etc/
+6. **The architecture changes (Phases 2-5) may still be valid** - just need a different hook point
+
+---
+
+## 20. Build Commands Reference
+
+```bash
+# Trigger build (after pushing changes)
+cd /home/claudetest/gki-build/fork-nomount
+sudo -u president gh workflow run "Build Kernels" -f ksu_variant=WKSU -f build_custom=true
+
+# Check build status
+sudo -u president gh run list --workflow="Build Kernels" --limit 3
+
+# Build URLs
+# https://github.com/Enginex0/GKI_KernelSU_SUSFS/actions/runs/XXXXX
+```
+
+---
+
+**END OF SESSION 2 UPDATE**
+
+---
+
 **END OF HANDOFF DOCUMENT**
 
 *For questions or clarification, review the dmesg logs on the device or examine the nomount-core-5.10.patch file directly.*
