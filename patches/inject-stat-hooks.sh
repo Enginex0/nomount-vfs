@@ -168,6 +168,8 @@ inject_vfs_getattr_nosec_hook() {
 # ============================================================================
 # INJECTION 4: Syscall-level hook in SYSCALL_DEFINE4(newfstatat)
 # This is the cleanest hook point - after VFS, before userspace copy
+# NOTE: cp_new_stat appears multiple times - in newstat, newlstat, AND newfstatat
+# We must only hook newfstatat which is SYSCALL_DEFINE4 (has dfd parameter)
 # ============================================================================
 inject_syscall_newfstatat_hook() {
     local marker="nomount_syscall_spoof_stat"
@@ -177,23 +179,26 @@ inject_syscall_newfstatat_hook() {
         return 0
     fi
 
-    # Anchor: return cp_new_stat(&stat, statbuf);
-    # This appears in SYSCALL_DEFINE4(newfstatat)
-    if ! grep -q 'return cp_new_stat(&stat, statbuf);' "$TARGET"; then
-        warn "Anchor 'return cp_new_stat(&stat, statbuf);' not found - may be different kernel version"
+    # Check for SYSCALL_DEFINE4(newfstatat specifically
+    if ! grep -q 'SYSCALL_DEFINE4(newfstatat' "$TARGET"; then
+        warn "SYSCALL_DEFINE4(newfstatat) not found - may be different kernel version"
         return 0
     fi
 
     info "Injecting newfstatat syscall hook..."
 
-    # Use awk for precise replacement - handles the return statement
+    # Use awk with state tracking - look for SYSCALL_DEFINE4(newfstatat
+    # then inject before the next cp_new_stat return in that function
     awk '
-    /return cp_new_stat\(&stat, statbuf\);/ && !done_newfstatat {
+    /SYSCALL_DEFINE4\(newfstatat/ {
+        in_newfstatat = 1
+    }
+    in_newfstatat && /return cp_new_stat\(&stat, statbuf\);/ {
         print "#ifdef CONFIG_FS_DCACHE_PREFETCH"
         print "\tnomount_syscall_spoof_stat(dfd, filename, &stat);"
         print "#endif"
         print $0
-        done_newfstatat = 1
+        in_newfstatat = 0
         next
     }
     { print }
@@ -210,6 +215,8 @@ inject_syscall_newfstatat_hook() {
 # ============================================================================
 # INJECTION 5: Syscall-level hook in COMPAT_SYSCALL_DEFINE4(newfstatat)
 # 32-bit compatibility syscall
+# NOTE: cp_compat_stat appears multiple times - in newstat, newlstat, AND newfstatat
+# We must only hook newfstatat which uses vfs_fstatat (has dfd parameter)
 # ============================================================================
 inject_compat_syscall_newfstatat_hook() {
     local marker_count
@@ -221,23 +228,26 @@ inject_compat_syscall_newfstatat_hook() {
         return 0
     fi
 
-    # Anchor: return cp_compat_stat(&stat, statbuf);
-    # This appears in COMPAT_SYSCALL_DEFINE4(newfstatat)
-    if ! grep -q 'return cp_compat_stat(&stat, statbuf);' "$TARGET"; then
-        warn "Anchor 'return cp_compat_stat(&stat, statbuf);' not found - may be different kernel version"
+    # Check for COMPAT_SYSCALL_DEFINE4(newfstatat specifically
+    if ! grep -q 'COMPAT_SYSCALL_DEFINE4(newfstatat' "$TARGET"; then
+        warn "COMPAT_SYSCALL_DEFINE4(newfstatat) not found - may be different kernel version"
         return 0
     fi
 
     info "Injecting compat newfstatat syscall hook..."
 
-    # Use awk for precise replacement
+    # Use awk with state tracking - look for COMPAT_SYSCALL_DEFINE4(newfstatat
+    # then inject before the next cp_compat_stat return in that function
     awk '
-    /return cp_compat_stat\(&stat, statbuf\);/ && !done_compat {
+    /COMPAT_SYSCALL_DEFINE4\(newfstatat/ {
+        in_compat_newfstatat = 1
+    }
+    in_compat_newfstatat && /return cp_compat_stat\(&stat, statbuf\);/ {
         print "#ifdef CONFIG_FS_DCACHE_PREFETCH"
         print "\tnomount_syscall_spoof_stat(dfd, filename, &stat);"
         print "#endif"
         print $0
-        done_compat = 1
+        in_compat_newfstatat = 0
         next
     }
     { print }
