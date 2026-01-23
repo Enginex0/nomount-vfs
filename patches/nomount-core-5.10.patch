@@ -72,7 +72,7 @@ new file mode 100644
 index 000000000..43ca3f0fa
 --- /dev/null
 +++ b/fs/vfs_dcache.c
-@@ -0,0 +1,2901 @@
+@@ -0,0 +1,2934 @@
 +#include <linux/module.h>
 +#include <linux/kernel.h>
 +#include <linux/init.h>
@@ -1115,6 +1115,12 @@ index 000000000..43ca3f0fa
 +		return;
 +	}
 +
++	/* Skip if SUSFS is handling stat spoofing for this inode (BIT_SUS_KSTAT = BIT(35)) */
++	if (inode->i_mapping && (inode->i_mapping->flags & (1UL << 35))) {
++		pr_info("nomount: [SPOOF_STAT] SKIP: SUSFS handling this inode\n");
++		return;
++	}
++
 +	if (nomount_is_uid_blocked(current_uid().val)) {
 +		pr_info("nomount: [SPOOF_STAT] SKIP: uid=%u blocked\n", current_uid().val);
 +		return;
@@ -1223,6 +1229,20 @@ index 000000000..43ca3f0fa
 +		pr_info("nomount: [SPOOF_STAT_DEV] SKIP: null_path=%d null_stat=%d disabled=%d\n",
 +			!path, !stat, NOMOUNT_DISABLED());
 +		return;
++	}
++
++	/* Skip if SUSFS is handling stat spoofing for this path (BIT_SUS_KSTAT = BIT(35)) */
++	{
++		struct path p;
++		if (kern_path(path, 0, &p) == 0) {
++			struct inode *inode = d_inode(p.dentry);
++			if (inode && inode->i_mapping && (inode->i_mapping->flags & (1UL << 35))) {
++				path_put(&p);
++				pr_info("nomount: [SPOOF_STAT_DEV] SKIP: SUSFS handling this path\n");
++				return;
++			}
++			path_put(&p);
++		}
 +	}
 +
 +	/* Skip spoofing for blocked UIDs (they can see through the injection) */
@@ -1397,6 +1417,19 @@ index 000000000..43ca3f0fa
 +	/* Only process absolute paths or AT_FDCWD relative paths starting with / */
 +	if (pathbuf[0] != '/')
 +		return;
++
++	/* Skip if SUSFS is handling stat spoofing for this path (BIT_SUS_KSTAT = BIT(35)) */
++	{
++		struct path p;
++		if (kern_path(pathbuf, 0, &p) == 0) {
++			struct inode *inode = d_inode(p.dentry);
++			if (inode && inode->i_mapping && (inode->i_mapping->flags & (1UL << 35))) {
++				path_put(&p);
++				return;
++			}
++			path_put(&p);
++		}
++	}
 +
 +	/* Ensure partition cache is initialized BEFORE entering RCU (kern_path sleeps) */
 +	if (nm_partition_devs[NM_PART_SYSTEM] == 0 && nm_system_dev == 0)
