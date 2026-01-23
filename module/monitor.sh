@@ -40,6 +40,19 @@ if [ -z "$LOADER" ]; then
     echo "[$(date '+%H:%M:%S')] [MONITOR] [ERROR] nm binary not found!" >> "$LOG_FILE"
     exit 1
 fi
+
+# ============================================================
+# SUSFS INTEGRATION - Load for cleanup functions
+# ============================================================
+SUSFS_INTEGRATION="$MODDIR/susfs_integration.sh"
+if [ -f "$SUSFS_INTEGRATION" ]; then
+    . "$SUSFS_INTEGRATION"
+    # Initialize SUSFS if available (for cleanup functions)
+    if type susfs_init >/dev/null 2>&1; then
+        susfs_init 2>/dev/null || true  # Don't fail if SUSFS unavailable
+    fi
+fi
+
 # Match partition list with service.sh
 TARGET_PARTITIONS="system vendor product system_ext odm oem mi_ext my_heytap prism optics oem_dlkm system_dlkm vendor_dlkm"
 
@@ -166,6 +179,65 @@ is_excluded() {
 }
 
 # ============================================================
+# FUNCTION: Clean rule cache entries for a specific module
+# Removes entries from .rule_cache that reference the module's paths
+# ============================================================
+clean_module_rule_cache() {
+    local mod_name="$1"
+    local tracking_file="$2"
+    local rule_cache="$NOMOUNT_DATA/.rule_cache"
+
+    log_debug "Cleaning rule cache for module: $mod_name"
+
+    if [ ! -f "$rule_cache" ]; then
+        log_debug "No rule cache file exists"
+        return 0
+    fi
+
+    if [ ! -f "$tracking_file" ]; then
+        log_debug "No tracking file to reference for cleanup"
+        return 0
+    fi
+
+    local temp_cache="${rule_cache}.tmp.$$"
+    local cleaned=0
+
+    # Filter out rules that match paths in the tracking file
+    while IFS='|' read -r cmd vpath rpath; do
+        [ -z "$cmd" ] && continue
+        # Pass through comments and non-add rules
+        case "$cmd" in
+            \#*|setdev|addmap|hide)
+                echo "${cmd}|${vpath}|${rpath}"
+                ;;
+            add)
+                # Check if this vpath is in the tracking file
+                if grep -qxF "$vpath" "$tracking_file" 2>/dev/null; then
+                    cleaned=$((cleaned + 1))
+                    log_debug "Removed from cache: $vpath"
+                else
+                    echo "${cmd}|${vpath}|${rpath}"
+                fi
+                ;;
+            *)
+                echo "${cmd}|${vpath}|${rpath}"
+                ;;
+        esac
+    done < "$rule_cache" > "$temp_cache"
+
+    # Atomic replace
+    if [ $cleaned -gt 0 ]; then
+        mv "$temp_cache" "$rule_cache" 2>/dev/null
+        log_info "Cleaned $cleaned entries from rule cache for $mod_name"
+    else
+        rm -f "$temp_cache"
+        log_debug "No rule cache entries to clean for $mod_name"
+    fi
+
+    return 0
+}
+
+# ============================================================
 # FUNCTION: Unregister all VFS paths for a module
 # Called when module is disabled/removed
 # ============================================================
@@ -182,6 +254,7 @@ unregister_module() {
 
     log_info "Unregistering module: $mod_name"
 
+    # Phase 1: Remove VFS rules from kernel
     local count=0
     local failed=0
     while IFS= read -r virtual_path; do
@@ -196,6 +269,25 @@ unregister_module() {
     done < "$tracking_file"
 
     log_info "Removed $count VFS rules for $mod_name (failed: $failed)"
+
+    # Phase 2: Clean SUSFS entries for this module
+    if type susfs_clean_module_entries >/dev/null 2>&1; then
+        susfs_clean_module_entries "$mod_name" "$tracking_file"
+    else
+        log_debug "SUSFS cleanup function not available"
+    fi
+
+    # Phase 3: Clean metadata cache for this module
+    if type susfs_clean_module_metadata_cache >/dev/null 2>&1; then
+        susfs_clean_module_metadata_cache "$mod_name" "$tracking_file"
+    else
+        log_debug "Metadata cache cleanup function not available"
+    fi
+
+    # Phase 4: Clean rule cache entries for this module
+    clean_module_rule_cache "$mod_name" "$tracking_file"
+
+    # Phase 5: Remove tracking file (AFTER using it for cleanup)
     rm -f "$tracking_file"
 
     # Remove skip_mount if we injected it

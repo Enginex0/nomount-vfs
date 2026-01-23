@@ -38,7 +38,7 @@ index a69e2cd36..8d52e7b00 100644
  static int prepend(char **buffer, int *buflen, const char *str, int namelen)
  {
  	*buflen -= namelen;
-@@ -265,6 +269,28 @@ char *d_path(const struct path *path, char *buf, int buflen)
+@@ -265,6 +269,31 @@ char *d_path(const struct path *path, char *buf, int buflen)
  	struct path root;
  	int error;
 +#ifdef CONFIG_FS_DCACHE_PREFETCH
@@ -149,7 +149,7 @@ new file mode 100644
 index 000000000..43ca3f0fa
 --- /dev/null
 +++ b/fs/vfs_dcache.c
-@@ -0,0 +1,2203 @@
+@@ -0,0 +1,2466 @@
 +#include <linux/module.h>
 +#include <linux/kernel.h>
 +#include <linux/init.h>
@@ -2621,7 +2621,7 @@ new file mode 100644
 index 000000000..9e0fb1b21
 --- /dev/null
 +++ b/include/linux/vfs_dcache.h
-@@ -0,0 +1,194 @@
+@@ -0,0 +1,202 @@
 +#ifndef _LINUX_VFS_DCACHE_H
 +#define _LINUX_VFS_DCACHE_H
 +
@@ -2970,7 +2970,7 @@ index 9a746a8c7..e3b4d2f81 100644
  
  #define SEQ_PUT_DEC(str, val) \
  		seq_put_decimal_ull_width(m, str, (val) << (PAGE_SHIFT-10), 8)
-@@ -330,5 +334,44 @@ show_map_vma(struct seq_file *m, struct vm_area_struct *vma)
+@@ -330,5 +334,48 @@ show_map_vma(struct seq_file *m, struct vm_area_struct *vma)
  	if (file) {
  		struct inode *inode = file_inode(vma->vm_file);
 +#ifdef CONFIG_FS_DCACHE_PREFETCH
