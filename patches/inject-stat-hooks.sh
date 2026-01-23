@@ -108,13 +108,77 @@ inject_generic_fillattr_hook() {
 }
 
 # ============================================================================
-# INJECTION 3: Hook in vfs_getattr_nosec() after generic_fillattr(inode, stat);
+# INJECTION 3: Hook in vfs_getattr_nosec() - WRAP the inode->i_op->getattr path
+# This is the PRIMARY hook - fires AFTER ovl_getattr() for OverlayFS files
 # ============================================================================
-inject_vfs_getattr_nosec_hook() {
-    local marker="vfs_dcache_spoof_stat_dev"
+inject_vfs_getattr_nosec_getattr_hook() {
+    local marker="__nm_getattr_ret"
 
     if grep -q "$marker" "$TARGET"; then
-        info "vfs_getattr_nosec hook already injected, skipping."
+        info "vfs_getattr_nosec getattr-path hook already injected, skipping."
+        return 0
+    fi
+
+    # We need to replace the early-return pattern:
+    #   if (inode->i_op->getattr)
+    #       return inode->i_op->getattr(path, stat, request_mask,
+    #                                   query_flags);
+    #
+    # With a wrapped version that stores the result, hooks on success, then returns.
+
+    if ! grep -q 'if (inode->i_op->getattr)' "$TARGET"; then
+        error "Anchor pattern 'if (inode->i_op->getattr)' not found in $TARGET"
+    fi
+
+    info "Injecting vfs_getattr_nosec getattr-path hook (post-getattr position)..."
+
+    # Use sed to replace the if-return pattern with wrapped version
+    # Match: if (inode->i_op->getattr)\n\t\treturn inode->i_op->getattr(
+    # Note: The actual return spans 2 lines due to line continuation
+    sed -i '/if (inode->i_op->getattr)$/{
+N
+N
+s/if (inode->i_op->getattr)\n\t\treturn inode->i_op->getattr(path, stat, request_mask,\n\t\t\t\t\t    query_flags);/if (inode->i_op->getattr) {\
+		int __nm_getattr_ret = inode->i_op->getattr(path, stat, request_mask,\
+						    query_flags);\
+#ifdef CONFIG_FS_DCACHE_PREFETCH\
+		if (__nm_getattr_ret == 0) {\
+			char *__nm_buf = (char *)__get_free_page(GFP_KERNEL);\
+			if (__nm_buf) {\
+				char *__nm_path = d_path(path, __nm_buf, PAGE_SIZE);\
+				if (!IS_ERR(__nm_path)) {\
+					dev_t __nm_dev_before = stat->dev;\
+					ino_t __nm_ino_before = stat->ino;\
+					vfs_dcache_spoof_stat_dev(__nm_path, stat);\
+					if (__nm_dev_before != stat->dev || __nm_ino_before != stat->ino) {\
+						pr_info("nomount: [HOOK] vfs_getattr_nosec(getattr) CHANGED path=%s dev=%u:%u->%u:%u ino=%lu->%lu\\n", __nm_path, MAJOR(__nm_dev_before), MINOR(__nm_dev_before), MAJOR(stat->dev), MINOR(stat->dev), __nm_ino_before, stat->ino);\
+					}\
+				}\
+				free_page((unsigned long)__nm_buf);\
+			}\
+		}\
+#endif\
+		return __nm_getattr_ret;\
+	}/
+}' "$TARGET"
+
+    # Verify
+    if ! grep -q "$marker" "$TARGET"; then
+        error "Failed to inject vfs_getattr_nosec getattr-path hook"
+    fi
+
+    info "vfs_getattr_nosec getattr-path hook injected successfully."
+}
+
+# ============================================================================
+# INJECTION 4: Hook in vfs_getattr_nosec() after generic_fillattr(inode, stat);
+# This is the FALLBACK hook - fires for simple inodes without custom getattr
+# ============================================================================
+inject_vfs_getattr_nosec_fillattr_hook() {
+    local marker="__nm_fillattr_spoof_done"
+
+    if grep -q "$marker" "$TARGET"; then
+        info "vfs_getattr_nosec fillattr-path hook already injected, skipping."
         return 0
     fi
 
@@ -124,45 +188,35 @@ inject_vfs_getattr_nosec_hook() {
         error "Anchor pattern 'generic_fillattr(inode, stat);' not found in $TARGET"
     fi
 
-    info "Injecting vfs_getattr_nosec hook..."
+    info "Injecting vfs_getattr_nosec fillattr-path hook..."
 
     # Inject after generic_fillattr(inode, stat);
     sed -i '/generic_fillattr(inode, stat);/a\
 #ifdef CONFIG_FS_DCACHE_PREFETCH\
+	/* __nm_fillattr_spoof_done - marker for idempotency */\
 	{\
 		char *__nm_buf = (char *)__get_free_page(GFP_KERNEL);\
-		dev_t __nm_dev_before;\
-		ino_t __nm_ino_before;\
 		if (__nm_buf) {\
 			char *__nm_path = d_path(path, __nm_buf, PAGE_SIZE);\
 			if (!IS_ERR(__nm_path)) {\
-				__nm_dev_before = stat->dev;\
-				__nm_ino_before = stat->ino;\
-				pr_info("nomount: [HOOK] vfs_getattr_nosec ENTER path=%s\\n", __nm_path);\
-				pr_info("nomount: [HOOK] vfs_getattr_nosec BEFORE dev=%u:%u ino=%lu uid=%u pid=%d\\n", MAJOR(stat->dev), MINOR(stat->dev), stat->ino, current_uid().val, current->pid);\
+				dev_t __nm_dev_before = stat->dev;\
+				ino_t __nm_ino_before = stat->ino;\
 				vfs_dcache_spoof_stat_dev(__nm_path, stat);\
-				pr_info("nomount: [HOOK] vfs_getattr_nosec AFTER dev=%u:%u ino=%lu\\n", MAJOR(stat->dev), MINOR(stat->dev), stat->ino);\
 				if (__nm_dev_before != stat->dev || __nm_ino_before != stat->ino) {\
-					pr_info("nomount: [HOOK] vfs_getattr_nosec CHANGED dev=%u:%u->%u:%u ino=%lu->%lu\\n", MAJOR(__nm_dev_before), MINOR(__nm_dev_before), MAJOR(stat->dev), MINOR(stat->dev), __nm_ino_before, stat->ino);\
-				} else {\
-					pr_info("nomount: [HOOK] vfs_getattr_nosec UNCHANGED\\n");\
+					pr_info("nomount: [HOOK] vfs_getattr_nosec(fillattr) CHANGED path=%s dev=%u:%u->%u:%u ino=%lu->%lu\\n", __nm_path, MAJOR(__nm_dev_before), MINOR(__nm_dev_before), MAJOR(stat->dev), MINOR(stat->dev), __nm_ino_before, stat->ino);\
 				}\
-			} else {\
-				pr_info("nomount: [HOOK] vfs_getattr_nosec d_path FAILED err=%ld\\n", PTR_ERR(__nm_path));\
 			}\
 			free_page((unsigned long)__nm_buf);\
-		} else {\
-			pr_info("nomount: [HOOK] vfs_getattr_nosec page alloc FAILED\\n");\
 		}\
 	}\
 #endif' "$TARGET"
 
     # Verify
     if ! grep -q "$marker" "$TARGET"; then
-        error "Failed to inject vfs_getattr_nosec hook"
+        error "Failed to inject vfs_getattr_nosec fillattr-path hook"
     fi
 
-    info "vfs_getattr_nosec hook injected successfully."
+    info "vfs_getattr_nosec fillattr-path hook injected successfully."
 }
 
 # ============================================================================
@@ -170,7 +224,8 @@ inject_vfs_getattr_nosec_hook() {
 # ============================================================================
 inject_include
 inject_generic_fillattr_hook
-inject_vfs_getattr_nosec_hook
+inject_vfs_getattr_nosec_getattr_hook
+inject_vfs_getattr_nosec_fillattr_hook
 
 info "All NoMount stat hooks injected successfully into $TARGET"
 exit 0

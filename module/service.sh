@@ -667,6 +667,14 @@ register_module_vfs() {
                 # Convert absolute real_path to relative virtual_path
                 virtual_path="${real_path#$mod_path}"
 
+                # Skip Magisk/KernelSU marker files - not real content
+                case "${real_path##*/}" in
+                    .replace|.remove|.gitkeep|.nomedia|.placeholder)
+                        log_debug "SKIP: Marker file $virtual_path"
+                        continue
+                        ;;
+                esac
+
                 # Read current counts
                 read f_cnt s_cnt w_cnt < "$count_file"
                 f_cnt=$((f_cnt + 1))
