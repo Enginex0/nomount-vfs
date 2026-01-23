@@ -1,0 +1,61 @@
+--- a/fs/vfs_dcache.c
++++ b/fs/vfs_dcache.c
+@@ -892,7 +892,13 @@ static void nomount_lazy_resolve_real_ino(void)
+
+ 	rcu_read_lock();
+ 	hash_for_each_rcu(nomount_rules_ht, bkt, rule, node) {
+-		if (rule->real_ino == 0 && rule->real_path) {
++		/* Use READ_ONCE to ensure we see updates from other CPUs.
++		 * Prevents race where multiple threads resolve same rule.
++		 */
++		if (READ_ONCE(rule->real_ino) == 0 && rule->real_path) {
+ 			rpath = kstrdup(rule->real_path, GFP_ATOMIC);
++			/* Early exit if another CPU just resolved it */
++			if (READ_ONCE(rule->real_ino) != 0)
++				goto skip;
+ 			break;
+ 		}
+ 	}
+@@ -902,7 +908,7 @@ static void nomount_lazy_resolve_real_ino(void)
+ 		return;
+
+ 	if (kern_path(rpath, LOOKUP_FOLLOW, &path) == 0) {
+-		if (path.dentry && d_backing_inode(path.dentry)) {
++		if (path.dentry && path.dentry->d_sb && d_backing_inode(path.dentry)) {
+ 			ino_t resolved_ino = d_backing_inode(path.dentry)->i_ino;
+ 			dev_t resolved_dev = path.dentry->d_sb->s_dev;
+
+@@ -910,9 +916,18 @@ static void nomount_lazy_resolve_real_ino(void)
+ 			hash_for_each_rcu(nomount_rules_ht, bkt, rule, node) {
+ 				if (rule->real_path && strcmp(rule->real_path, rpath) == 0 &&
+-				    rule->real_ino == 0) {
+-					rule->real_ino = resolved_ino;
+-					rule->real_dev = resolved_dev;
++				    READ_ONCE(rule->real_ino) == 0) {
++					/* Memory barrier ensures real_dev written before real_ino.
++					 * Readers check real_ino first (non-zero = resolved), so
++					 * this ordering prevents seeing valid ino with stale dev
++					 * (data race on ARM64 due to weak memory ordering).
++					 *
++					 * Write order: real_dev -> barrier -> real_ino
++					 * Read order: real_ino (if non-zero) -> real_dev is valid
++					 */
++					WRITE_ONCE(rule->real_dev, resolved_dev);
++					smp_wmb();  /* Write memory barrier */
++					WRITE_ONCE(rule->real_ino, resolved_ino);
++
+ 					pr_info("nomount: [LAZY_RESOLVE] %s -> ino=%lu dev=%u:%u\n",
+ 						rpath, resolved_ino, MAJOR(resolved_dev), MINOR(resolved_dev));
+ 					break;
+@@ -920,7 +935,11 @@ static void nomount_lazy_resolve_real_ino(void)
+ 			}
+ 			spin_unlock(&nomount_lock);
++		} else {
++			NM_DBG("lazy_resolve: kern_path succeeded but invalid components for %s\n", rpath);
+ 		}
+ 		path_put(&path);
+ 	}
++
++skip:
+ 	kfree(rpath);
+ }
