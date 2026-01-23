@@ -137,6 +137,7 @@ typedef unsigned long size_t;
 
 /* Maps filtering IOCTLs */
 #define IOCTL_ADD_MAPS_PATTERN    0x40084E30  /* _IOW(0x4E, 0x30, char*) */
+#define IOCTL_DEL_MAPS_PATTERN    0x40084E31  /* _IOW(0x4E, 0x31, char*) */
 #define IOCTL_CLEAR_MAPS_PATTERNS 0x4E32      /* _IO(0x4E, 0x32) */
 
 /* Module enable/disable IOCTLs - module starts DISABLED to prevent early boot deadlock */
@@ -202,7 +203,7 @@ void c_main(long *sp) {
     long exit_code = 1; 
     
     if (argc < 2) {
-        sys3(SYS_WRITE, 1, (long)"nm add|del|clear|blk|unb|list|hide|unhide|clrhide|setdev|addmap|clrmap|enable|disable\n", 88);
+        sys3(SYS_WRITE, 1, (long)"nm v|add|del|clear|blk|unb|list|hide|unhide|clrhide|setdev|addmap|delmap|clrmap|enable|disable|status|resolve\n", 112);
         goto do_exit;
     }
 
@@ -219,10 +220,10 @@ void c_main(long *sp) {
     long ioctl_code = 0;
     int needed = 2;
     /* 'add' needs 4 args, but 'addmap' only needs 3 - check 4th char to distinguish */
-    /* Commands that need only 2 args: clear, version, list, addmap, clrhide, clrmap, enable, disable */
+    /* Commands that need only 2 args: clear, version, list, addmap, clrhide, clrmap, enable, disable, status, resolve */
     if (cmd == 'a' && argv[1][1] == 'd' && argv[1][2] == 'd' && argv[1][3] != 'm') needed = 4;
     else if (cmd != 'c' && cmd != 'v' && cmd != 'l' && cmd != 'a' && cmd != 'e' &&
-             !(cmd == 'd' && argv[1][1] == 'i')) needed = 3; 
+             cmd != 's' && cmd != 'r' && !(cmd == 'd' && argv[1][1] == 'i')) needed = 3; 
     
     if (argc < needed) goto do_exit;
 
@@ -233,6 +234,34 @@ void c_main(long *sp) {
         if (argc < 3) goto do_exit;
         ioctl_arg = argv[2];
         ioctl_code = IOCTL_ADD_MAPS_PATTERN;
+    }
+    /* delmap <pattern> - Delete maps filter pattern */
+    else if (cmd == 'd' && argv[1][1] == 'e' && argv[1][2] == 'l' && argv[1][3] == 'm') {
+        if (argc < 3) goto do_exit;
+        ioctl_arg = argv[2];
+        ioctl_code = IOCTL_DEL_MAPS_PATTERN;
+    }
+    /* status - Show module status (userspace check) */
+    else if (cmd == 's' && argv[1][1] == 't' && argv[1][2] == 'a') {
+        int ver = 0;
+        ioctl_arg = &ver;
+        long res = sys3(SYS_IOCTL, fd, IOCTL_VER, (long)ioctl_arg);
+        if (res > 0) {
+            char msg[] = "NoMount: ACTIVE (version X)\n";
+            msg[25] = (char)(res + '0');
+            sys3(SYS_WRITE, 1, (long)msg, 28);
+        } else {
+            sys3(SYS_WRITE, 1, (long)"NoMount: ERROR (ioctl failed)\n", 30);
+        }
+        sys1(SYS_CLOSE, fd);
+        exit_code = (res > 0) ? 0 : 1;
+        goto do_exit;
+    }
+    /* resolve - Trigger lazy inode resolution via list */
+    else if (cmd == 'r' && argv[1][1] == 'e' && argv[1][2] == 's') {
+        sys3(SYS_WRITE, 1, (long)"Triggering lazy inode resolution...\n", 37);
+        ioctl_code = IOCTL_LIST;
+        ioctl_arg = (void *)list_buffer;
     }
     /* clrhide - Clear all hidden mounts */
     else if (cmd == 'c' && argv[1][1] == 'l' && argv[1][2] == 'r' && argv[1][3] == 'h') {
