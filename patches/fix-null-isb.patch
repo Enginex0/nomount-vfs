@@ -1,0 +1,44 @@
+--- a/fs/vfs_dcache.c
++++ b/fs/vfs_dcache.c
+@@ -979,7 +979,7 @@ bool nomount_is_injected_file(struct inode *inode) {
+
+ 	pr_info("nomount: [IS_INJECTED] ENTER inode=%p\n", inode);
+
+-	if (!inode || NOMOUNT_DISABLED()) {
++	if (!inode || !inode->i_sb || NOMOUNT_DISABLED()) {
+ 		pr_info("nomount: [IS_INJECTED] SKIP: null_inode=%d disabled=%d\n",
+ 			!inode, NOMOUNT_DISABLED());
+ 		NM_DBG("is_injected: early exit (null=%d disabled=%d)\n",
+@@ -1034,7 +1034,7 @@ void nomount_spoof_stat(struct inode *inode, struct kstat *stat)
+ 		return;
+ 	}
+
+-	if (!inode || NOMOUNT_DISABLED()) {
++	if (!inode || !inode->i_sb || NOMOUNT_DISABLED()) {
+ 		pr_info("nomount: [SPOOF_STAT] SKIP: null_inode=%d disabled=%d\n",
+ 			!inode, NOMOUNT_DISABLED());
+ 		return;
+@@ -1372,6 +1372,11 @@ int nomount_spoof_statfs(struct inode *inode, struct kstatfs *buf)
+ 		return 0;
+ 	}
+
++	if (!inode->i_sb) {
++		pr_info("nomount: [SPOOF_STATFS] SKIP: null i_sb\n");
++		return 0;
++	}
++
+ 	/* Try to resolve any unresolved rules */
+ 	nomount_lazy_resolve_real_ino();
+
+@@ -1564,6 +1569,11 @@ const char *nomount_get_spoofed_selinux_context(struct inode *inode) {
+ 		return NULL;
+ 	}
+
++	if (!inode->i_sb) {
++		pr_info("nomount: [GET_SELINUX] SKIP: null i_sb\n");
++		return NULL;
++	}
++
+ 	/* Try to resolve any unresolved rules */
+ 	nomount_lazy_resolve_real_ino();
+
