@@ -242,24 +242,6 @@
 -		}
  	}
  
- 	/*
-@@ -1288,18 +1234,10 @@
- 	 * appear to be on system partitions (e.g., /system/fonts/X.ttf).
- 	 */
- 	if (!rule_matched) {
--		pr_info("nomount: [SPOOF_STAT_DEV] PHASE2: prefix fallback (no rule matched)\n");
- 		expected_dev = nomount_get_partition_dev_for_path(path);
--		pr_info("nomount: [SPOOF_STAT_DEV] PHASE2 result: expected_dev=%u:%u\n",
--			MAJOR(expected_dev), MINOR(expected_dev));
- 	}
- 
- 	/* Apply spoofing if we found a device to spoof to */
--	pr_info("nomount: [SPOOF_STAT_DEV] ============ DECISION ============\n");
--	pr_info("nomount: [SPOOF_STAT_DEV] expected_dev=%u:%u actual_dev=%u:%u rule_matched=%d\n",
--		MAJOR(expected_dev), MINOR(expected_dev), MAJOR(stat->dev), MINOR(stat->dev), rule_matched);
--	pr_info("nomount: [SPOOF_STAT_DEV] expected_nonzero=%d mismatch=%d\n",
--		expected_dev != 0, stat->dev != expected_dev);
- 	if (expected_dev != 0 && stat->dev != expected_dev) {
  		orig_dev = stat->dev;
  		orig_ino = stat->ino;
 @@ -1316,25 +1254,14 @@
