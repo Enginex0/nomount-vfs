@@ -88,14 +88,7 @@ inject_generic_fillattr_hook() {
     sed -i '/stat->ino = inode->i_ino;/a\
 #ifdef CONFIG_FS_DCACHE_PREFETCH\
 	if (nomount_is_injected_file(inode)) {\
-		dev_t __gf_dev_before = stat->dev;\
-		ino_t __gf_ino_before = stat->ino;\
-		pr_info("nomount: [HOOK] generic_fillattr ENTER ino=%lu dev=%u:%u uid=%u\\n", inode->i_ino, MAJOR(stat->dev), MINOR(stat->dev), current_uid().val);\
 		nomount_spoof_stat(inode, stat);\
-		pr_info("nomount: [HOOK] generic_fillattr AFTER dev=%u:%u ino=%lu\\n", MAJOR(stat->dev), MINOR(stat->dev), stat->ino);\
-		if (__gf_dev_before != stat->dev || __gf_ino_before != stat->ino) {\
-			pr_info("nomount: [HOOK] generic_fillattr CHANGED dev=%u:%u->%u:%u ino=%lu->%lu\\n", MAJOR(__gf_dev_before), MINOR(__gf_dev_before), MAJOR(stat->dev), MINOR(stat->dev), __gf_ino_before, stat->ino);\
-		}\
 	}\
 #endif' "$TARGET"
 
@@ -136,23 +129,9 @@ inject_vfs_getattr_nosec_hook() {
 		if (__nm_buf) {\
 			char *__nm_path = d_path(path, __nm_buf, PAGE_SIZE);\
 			if (!IS_ERR(__nm_path)) {\
-				__nm_dev_before = stat->dev;\
-				__nm_ino_before = stat->ino;\
-				pr_info("nomount: [HOOK] vfs_getattr_nosec ENTER path=%s\\n", __nm_path);\
-				pr_info("nomount: [HOOK] vfs_getattr_nosec BEFORE dev=%u:%u ino=%lu uid=%u pid=%d\\n", MAJOR(stat->dev), MINOR(stat->dev), stat->ino, current_uid().val, current->pid);\
 				vfs_dcache_spoof_stat_dev(__nm_path, stat);\
-				pr_info("nomount: [HOOK] vfs_getattr_nosec AFTER dev=%u:%u ino=%lu\\n", MAJOR(stat->dev), MINOR(stat->dev), stat->ino);\
-				if (__nm_dev_before != stat->dev || __nm_ino_before != stat->ino) {\
-					pr_info("nomount: [HOOK] vfs_getattr_nosec CHANGED dev=%u:%u->%u:%u ino=%lu->%lu\\n", MAJOR(__nm_dev_before), MINOR(__nm_dev_before), MAJOR(stat->dev), MINOR(stat->dev), __nm_ino_before, stat->ino);\
-				} else {\
-					pr_info("nomount: [HOOK] vfs_getattr_nosec UNCHANGED\\n");\
-				}\
-			} else {\
-				pr_info("nomount: [HOOK] vfs_getattr_nosec d_path FAILED err=%ld\\n", PTR_ERR(__nm_path));\
 			}\
 			free_page((unsigned long)__nm_buf);\
-		} else {\
-			pr_info("nomount: [HOOK] vfs_getattr_nosec page alloc FAILED\\n");\
 		}\
 	}\
 #endif' "$TARGET"
