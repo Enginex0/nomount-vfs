@@ -124,8 +124,6 @@ inject_vfs_getattr_nosec_hook() {
 #ifdef CONFIG_FS_DCACHE_PREFETCH\
 	{\
 		char *__nm_buf = (char *)__get_free_page(GFP_KERNEL);\
-		dev_t __nm_dev_before;\
-		ino_t __nm_ino_before;\
 		if (__nm_buf) {\
 			char *__nm_path = d_path(path, __nm_buf, PAGE_SIZE);\
 			if (!IS_ERR(__nm_path)) {\
