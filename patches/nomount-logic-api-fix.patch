@@ -1,0 +1,20 @@
+--- fs/vfs_dcache.c.before-logic	2026-01-24 11:08:36.284515368 +0100
++++ fs/vfs_dcache.c	2026-01-24 11:08:51.008415916 +0100
+@@ -2009,7 +2009,7 @@
+ 	dir_path = d_path(&file->f_path, page_buf, PAGE_SIZE);
+ 	if (IS_ERR(dir_path)) {
+ 		NM_DBG("inject_dents64: d_path failed (err=%ld)\n", PTR_ERR(dir_path));
+-		free_page((unsigned long)page_buf);
++		__putname(page_buf);
+ 		return;
+ 	}
+ 
+@@ -2085,7 +2085,7 @@
+ 	dir_path = d_path(&file->f_path, page_buf, PAGE_SIZE);
+ 	if (IS_ERR(dir_path)) {
+ 		NM_DBG("inject_dents: d_path failed (err=%ld)\n", PTR_ERR(dir_path));
+-		free_page((unsigned long)page_buf);
++		__putname(page_buf);
+ 		return;
+ 	}
+ 
