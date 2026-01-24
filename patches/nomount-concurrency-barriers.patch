@@ -23,12 +23,3 @@
  					pr_info("nomount: [LAZY_RESOLVE] %s -> ino=%lu dev=%u:%u\n",
  						rpath, resolved_ino, MAJOR(resolved_dev), MINOR(resolved_dev));
  					break;
-@@ -995,6 +1005,8 @@
- 		}
- 		path_put(&path);
- 	}
-+
-+skip:
- 	kfree(rpath);
- }
- 
