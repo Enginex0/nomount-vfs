@@ -1,19 +1,85 @@
---- a/fs/vfs_dcache.c
-+++ b/fs/vfs_dcache.c
-@@ -1944,7 +1944,7 @@ static int nomount_inject_dents64(struct file *file, struct dir_context *ctx)
- 	dir_path = d_path(&file->f_path, page_buf, PAGE_SIZE);
- 	if (IS_ERR(dir_path)) {
- 		NM_DBG("inject_dents64: d_path failed (err=%ld)\n", PTR_ERR(dir_path));
--		free_page((unsigned long)page_buf);
-+		__putname(page_buf);  /* Correct API for __getname() */
+--- a/fs/vfs_dcache.c	2026-01-24 10:29:12.214443450 +0100
++++ fs/vfs_dcache.c	2026-01-24 10:30:09.781348175 +0100
+@@ -472,9 +472,6 @@
+ 		if (paths) {
+ 			i = 0;
+ 			list_for_each_entry(rule, &nomount_rules_list, list) {
+-				/* Prevent buffer overflow if list grew between count and copy */
+-				if (i >= count)
+-					break;
+ 				if (i < count)
+ 					paths[i++] = kstrdup(rule->virtual_path, GFP_ATOMIC);
+ 			}
+@@ -560,15 +557,6 @@
+ 
+ 			ret = kern_path(parent_path, LOOKUP_FOLLOW, &vpath);
+ 			if (ret == 0) {
+-				/* Verify kern_path() returned valid mount/dentry/sb */
+-				if (!vpath.mnt || !vpath.dentry || !vpath.dentry->d_sb) {
+-					NM_DBG("cache_metadata: kern_path succeeded but invalid vpath components (mnt=%p dentry=%p sb=%p)\n",
+-						vpath.mnt, vpath.dentry, vpath.dentry ? vpath.dentry->d_sb : NULL);
+-					path_put(&vpath);
+-					parent_depth++;
+-					continue;
+-				}
+-
+ 				/* Found existing parent! Cache its statfs */
+ 				rule->cached_partition_dev = vpath.dentry->d_sb->s_dev;
+ 				mnt_path.mnt = vpath.mnt;
+@@ -651,12 +639,6 @@
+ 	char *found_path = NULL;
+ 
+ 	if (!inode || NOMOUNT_DISABLED()) return NULL;
+-	if (!inode->i_sb) {
+-		/* Pseudo-files (pipes, sockets, devices) have no superblock */
+-		NM_DBG("get_vpath: null i_sb for inode=%p, skipping\n", inode);
+-		return NULL;
+-	}
+-
+ 	if (nomount_is_uid_blocked(current_uid().val)) return NULL;
+ 	NOMOUNT_HOOK_ENTER_RET(NULL);  /* Recursion guard */
+ 
+@@ -974,39 +956,25 @@
  		return;
+ 
+ 	if (kern_path(rpath, LOOKUP_FOLLOW, &path) == 0) {
+-		if (path.dentry && path.dentry->d_sb && d_backing_inode(path.dentry)) {
++		if (path.dentry && d_backing_inode(path.dentry)) {
+ 			ino_t resolved_ino = d_backing_inode(path.dentry)->i_ino;
+ 			dev_t resolved_dev = path.dentry->d_sb->s_dev;
+ 
+ 			spin_lock(&nomount_lock);
+ 			hash_for_each_rcu(nomount_rules_ht, bkt, rule, node) {
+ 				if (rule->real_path && strcmp(rule->real_path, rpath) == 0 &&
+-				    READ_ONCE(rule->real_ino) == 0) {
+-					/* Memory barrier ensures real_dev written before real_ino.
+-					 * Readers check real_ino first (non-zero = resolved), so
+-					 * this ordering prevents seeing valid ino with stale dev
+-					 * (data race on ARM64 due to weak memory ordering).
+-					 *
+-					 * Write order: real_dev -> barrier -> real_ino
+-					 * Read order: real_ino (if non-zero) -> real_dev is valid
+-					 */
+-					WRITE_ONCE(rule->real_dev, resolved_dev);
+-					smp_wmb();  /* Write memory barrier */
+-					WRITE_ONCE(rule->real_ino, resolved_ino);
+-
++				    rule->real_ino == 0) {
++					rule->real_ino = resolved_ino;
++					rule->real_dev = resolved_dev;
+ 					pr_info("nomount: [LAZY_RESOLVE] %s -> ino=%lu dev=%u:%u\n",
+ 						rpath, resolved_ino, MAJOR(resolved_dev), MINOR(resolved_dev));
+ 					break;
+ 				}
+ 			}
+ 			spin_unlock(&nomount_lock);
+-		} else {
+-			NM_DBG("lazy_resolve: kern_path succeeded but invalid components for %s\n", rpath);
+ 		}
+ 		path_put(&path);
  	}
-
-@@ -2020,7 +2020,7 @@ static int nomount_inject_dents(struct file *file, struct dir_context *ctx)
- 	dir_path = d_path(&file->f_path, page_buf, PAGE_SIZE);
- 	if (IS_ERR(dir_path)) {
- 		NM_DBG("inject_dents: d_path failed (err=%ld)\n", PTR_ERR(dir_path));
--		free_page((unsigned long)page_buf);
-+		__putname(page_buf);  /* Correct API for __getname() */
- 		return;
- 	}
+-
+-skip:
+ 	kfree(rpath);
+ }
+ 

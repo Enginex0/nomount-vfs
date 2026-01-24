@@ -1,19 +1,17 @@
---- a/fs/vfs_dcache.c
-+++ b/fs/vfs_dcache.c
-@@ -471,7 +471,10 @@ static void nomount_force_refresh_all(void) {
+--- a/fs/vfs_dcache.c	2026-01-24 10:27:38.133947736 +0100
++++ b/fs/vfs_dcache.c	2026-01-24 10:28:03.433189267 +0100
+@@ -472,6 +472,9 @@
  		if (paths) {
  			i = 0;
  			list_for_each_entry(rule, &nomount_rules_list, list) {
--				if (i < count)
 +				/* Prevent buffer overflow if list grew between count and copy */
 +				if (i >= count)
 +					break;
-+				if (i < count)
+ 				if (i < count)
  					paths[i++] = kstrdup(rule->virtual_path, GFP_ATOMIC);
  			}
- 		}
-@@ -558,6 +561,15 @@ static int nomount_cache_partition_metadata(struct nomount_rule *rule)
-
+@@ -557,6 +560,15 @@
+ 
  			ret = kern_path(parent_path, LOOKUP_FOLLOW, &vpath);
  			if (ret == 0) {
 +				/* Verify kern_path() returned valid mount/dentry/sb */
@@ -28,9 +26,9 @@
  				/* Found existing parent! Cache its statfs */
  				rule->cached_partition_dev = vpath.dentry->d_sb->s_dev;
  				mnt_path.mnt = vpath.mnt;
-@@ -641,6 +653,12 @@ char *nomount_get_virtual_path_for_inode(struct inode *inode) {
+@@ -639,6 +651,12 @@
  	char *found_path = NULL;
-
+ 
  	if (!inode || NOMOUNT_DISABLED()) return NULL;
 +	if (!inode->i_sb) {
 +		/* Pseudo-files (pipes, sockets, devices) have no superblock */
@@ -40,25 +38,17 @@
 +
  	if (nomount_is_uid_blocked(current_uid().val)) return NULL;
  	NOMOUNT_HOOK_ENTER_RET(NULL);  /* Recursion guard */
-
-@@ -952,20 +970,22 @@ static void nomount_lazy_resolve_real_ino(void)
+ 
+@@ -956,7 +974,7 @@
  		return;
-
+ 
  	if (kern_path(rpath, LOOKUP_FOLLOW, &path) == 0) {
 -		if (path.dentry && d_backing_inode(path.dentry)) {
 +		if (path.dentry && path.dentry->d_sb && d_backing_inode(path.dentry)) {
  			ino_t resolved_ino = d_backing_inode(path.dentry)->i_ino;
  			dev_t resolved_dev = path.dentry->d_sb->s_dev;
-
- 			spin_lock(&nomount_lock);
- 			hash_for_each_rcu(nomount_rules_ht, bkt, rule, node) {
- 				if (rule->real_path && strcmp(rule->real_path, rpath) == 0 &&
- 				    rule->real_ino == 0) {
- 					rule->real_ino = resolved_ino;
- 					rule->real_dev = resolved_dev;
- 					pr_info("nomount: [LAZY_RESOLVE] %s -> ino=%lu dev=%u:%u\n",
- 						rpath, resolved_ino, MAJOR(resolved_dev), MINOR(resolved_dev));
- 					break;
+ 
+@@ -972,6 +990,8 @@
  				}
  			}
  			spin_unlock(&nomount_lock);
@@ -67,16 +57,3 @@
  		}
  		path_put(&path);
  	}
-@@ -1318,6 +1338,12 @@ void nomount_syscall_spoof_stat(int dfd, const char __user *filename, struct ks
- 		return;
-
- 	len = strncpy_from_user(pathbuf, filename, sizeof(pathbuf));
-+	if (len < 0) {
-+		/* Copy from userspace failed - invalid pointer */
-+		NM_ERR("syscall_spoof_stat: strncpy_from_user failed (err=%ld) for filename=%p\n",
-+			len, filename);
-+		return;
-+	}
- 	pathbuf[sizeof(pathbuf) - 1] = '\0';
-
- 	path = nomount_normalize_path(pathbuf);
