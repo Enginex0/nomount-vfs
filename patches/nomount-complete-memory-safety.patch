@@ -1,18 +1,6 @@
 --- a/fs/vfs_dcache.c
 +++ b/fs/vfs_dcache.c
-@@ -641,6 +641,12 @@ char *nomount_get_virtual_path_for_inode(struct inode *inode) {
- 	char *found_path = NULL;
-
- 	if (!inode || NOMOUNT_DISABLED()) return NULL;
-+	if (!inode->i_sb) {
-+		/* Pseudo-files (pipes, sockets, devices) have no superblock */
-+		NM_DBG("get_vpath: null i_sb for inode=%p, skipping\n", inode);
-+		return NULL;
-+	}
- 	if (nomount_is_uid_blocked(current_uid().val)) return NULL;
- 	NOMOUNT_HOOK_ENTER_RET(NULL);  /* Recursion guard */
-
-@@ -471,7 +477,10 @@ static void nomount_force_refresh_all(void) {
+@@ -471,7 +471,10 @@ static void nomount_force_refresh_all(void) {
  		if (paths) {
  			i = 0;
  			list_for_each_entry(rule, &nomount_rules_list, list) {
@@ -24,7 +12,7 @@
  					paths[i++] = kstrdup(rule->virtual_path, GFP_ATOMIC);
  			}
  		}
-@@ -558,6 +567,15 @@ static int nomount_cache_partition_metadata(struct nomount_rule *rule)
+@@ -558,6 +561,15 @@ static int nomount_cache_partition_metadata(struct nomount_rule *rule)
 
  		ret = kern_path(parent_path, LOOKUP_FOLLOW, &vpath);
  		if (ret == 0) {
@@ -40,6 +28,18 @@
  			/* Found existing parent! Cache its statfs */
  			rule->cached_partition_dev = vpath.dentry->d_sb->s_dev;
  			mnt_path.mnt = vpath.mnt;
+@@ -641,6 +653,12 @@ char *nomount_get_virtual_path_for_inode(struct inode *inode) {
+ 	char *found_path = NULL;
+
+ 	if (!inode || NOMOUNT_DISABLED()) return NULL;
++	if (!inode->i_sb) {
++		/* Pseudo-files (pipes, sockets, devices) have no superblock */
++		NM_DBG("get_vpath: null i_sb for inode=%p, skipping\n", inode);
++		return NULL;
++	}
+ 	if (nomount_is_uid_blocked(current_uid().val)) return NULL;
+ 	NOMOUNT_HOOK_ENTER_RET(NULL);  /* Recursion guard */
+
 @@ -952,7 +970,11 @@ static void nomount_lazy_resolve_real_ino(void)
  		return;
 
