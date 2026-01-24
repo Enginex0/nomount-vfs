@@ -116,10 +116,14 @@ if [ -d "$MODULES_DIR" ]; then
         modules_scanned=$((modules_scanned + 1))
         for partition in $TARGET_PARTITIONS; do
             if [ -d "$mod_path/$partition" ]; then
-                find "$mod_path/$partition" -type f 2>/dev/null | while read -r real_path; do
+                # Avoid pipe subshell - use temp file so functions run in main shell
+                _pfd_tmp="/data/local/tmp/nm_meta_$$"
+                find "$mod_path/$partition" -type f 2>/dev/null > "$_pfd_tmp"
+                while read -r real_path; do
                     vpath="${real_path#$mod_path}"
                     type susfs_capture_metadata >/dev/null 2>&1 && susfs_capture_metadata "$vpath"
-                done
+                done < "$_pfd_tmp"
+                rm -f "$_pfd_tmp"
             fi
         done
     done
@@ -142,11 +146,6 @@ validate_and_clean_cache() {
         case "$cmd" in
             \#*)
                 echo "${cmd}|${vpath}|${rpath}" >> "$temp_cache"
-                continue
-                ;;
-            setdev|addmap|hide)
-                echo "${cmd}|${vpath}|${rpath}" >> "$temp_cache"
-                kept=$((kept + 1))
                 continue
                 ;;
         esac
@@ -201,20 +200,17 @@ while IFS='|' read -r cmd vpath rpath || [ -n "$cmd" ]; do
         add)
             [ -z "$vpath" ] || [ -z "$rpath" ] && { fail_count=$((fail_count + 1)); continue; }
             [ "$rpath" != "/nonexistent" ] && [ ! -e "$rpath" ] && { fail_count=$((fail_count + 1)); continue; }
-            "$NM_BIN" add "$vpath" "$rpath" </dev/null >/dev/null 2>&1 && count=$((count + 1)) || fail_count=$((fail_count + 1))
-            ;;
-        hide)
-            [ -z "$vpath" ] && { fail_count=$((fail_count + 1)); continue; }
-            "$NM_BIN" hide "$vpath" </dev/null >/dev/null 2>&1 && count=$((count + 1)) || fail_count=$((fail_count + 1))
-            ;;
-        setdev)
-            [ -z "$vpath" ] || [ -z "$rpath" ] && { fail_count=$((fail_count + 1)); continue; }
-            local major="${rpath%%:*}" minor="${rpath##*:}"
-            "$NM_BIN" setdev "$vpath" "$major" "$minor" </dev/null >/dev/null 2>&1 && count=$((count + 1)) || fail_count=$((fail_count + 1))
-            ;;
-        addmap)
-            [ -z "$vpath" ] && { fail_count=$((fail_count + 1)); continue; }
-            "$NM_BIN" addmap "$vpath" </dev/null >/dev/null 2>&1 && count=$((count + 1)) || fail_count=$((fail_count + 1))
+            if "$NM_BIN" add "$vpath" "$rpath" </dev/null >/dev/null 2>&1; then
+                count=$((count + 1))
+                # Apply SUSFS kstat_redirect for cached rules
+                if type susfs_apply_kstat >/dev/null 2>&1; then
+                    local metadata
+                    metadata=$(susfs_get_cached_metadata "$vpath")
+                    [ -n "$metadata" ] && susfs_apply_kstat "$vpath" "$metadata" "$rpath"
+                fi
+            else
+                fail_count=$((fail_count + 1))
+            fi
             ;;
     esac
 done < "$RULE_CACHE"

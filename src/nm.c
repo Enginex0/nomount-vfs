@@ -162,38 +162,6 @@ static char list_buffer[LIST_BUF_SIZE];
 /* Static buffers to replace dangerous stack pointer arithmetic */
 static char path_buffer[PATH_MAX];
 static unsigned int stat_buffer[32];  /* stat struct buffer */
-static int int_buffer;                /* For single int ioctl args */
-static struct nm_partition_dev pd_buffer;  /* For setdev command */
-
-/* Parse integer with validation - returns 0 on success, -1 on error */
-static int parse_int(const char *s, int *out) {
-    if (!s || !*s) return -1;
-    int val = 0;
-    while (*s) {
-        if (*s < '0' || *s > '9') return -1;  /* Not a digit */
-        int prev = val;
-        val = val * 10 + (*s - '0');
-        if (val < prev) return -1;  /* Overflow */
-        s++;
-    }
-    *out = val;
-    return 0;
-}
-
-/* Parse unsigned int with validation */
-static int parse_uint(const char *s, unsigned int *out) {
-    if (!s || !*s) return -1;
-    unsigned int val = 0;
-    while (*s) {
-        if (*s < '0' || *s > '9') return -1;
-        unsigned int prev = val;
-        val = val * 10 + (*s - '0');
-        if (val < prev) return -1;  /* Overflow */
-        s++;
-    }
-    *out = val;
-    return 0;
-}
 
 /* --- MAIN --- */
 __attribute__((noreturn, used))
@@ -203,7 +171,7 @@ void c_main(long *sp) {
     long exit_code = 1; 
     
     if (argc < 2) {
-        sys3(SYS_WRITE, 1, (long)"nm v|add|del|clear|blk|unb|list|hide|unhide|clrhide|setdev|addmap|delmap|clrmap|enable|disable|status|resolve\n", 112);
+        sys3(SYS_WRITE, 1, (long)"nm v|add|del|clear|list|enable|disable|status|resolve\n", 56);
         goto do_exit;
     }
 
@@ -216,33 +184,16 @@ void c_main(long *sp) {
     char cmd = argv[1][0];
     struct ioctl_data data;
     void *ioctl_arg = 0;
-    unsigned int uid = 0;
     long ioctl_code = 0;
     int needed = 2;
-    /* 'add' needs 4 args, but 'addmap' only needs 3 - check 4th char to distinguish */
-    /* Commands that need only 2 args: clear, version, list, addmap, clrhide, clrmap, enable, disable, status, resolve */
-    if (cmd == 'a' && argv[1][1] == 'd' && argv[1][2] == 'd' && argv[1][3] != 'm') needed = 4;
-    else if (cmd != 'c' && cmd != 'v' && cmd != 'l' && cmd != 'a' && cmd != 'e' &&
-             cmd != 's' && cmd != 'r' && !(cmd == 'd' && argv[1][1] == 'i')) needed = 3; 
+    /* 'add' needs 4 args (vpath + rpath), 'del' needs 3 */
+    if (cmd == 'a' && argv[1][1] == 'd' && argv[1][2] == 'd') needed = 4;
+    else if (cmd == 'd' && argv[1][1] == 'e' && argv[1][2] == 'l') needed = 3; 
     
     if (argc < needed) goto do_exit;
 
-    /* ========== NEW COMMANDS (check these first - more specific) ========== */
-
-    /* addmap <pattern> - Add maps filter pattern */
-    if (cmd == 'a' && argv[1][1] == 'd' && argv[1][2] == 'd' && argv[1][3] == 'm') {
-        if (argc < 3) goto do_exit;
-        ioctl_arg = argv[2];
-        ioctl_code = IOCTL_ADD_MAPS_PATTERN;
-    }
-    /* delmap <pattern> - Delete maps filter pattern */
-    else if (cmd == 'd' && argv[1][1] == 'e' && argv[1][2] == 'l' && argv[1][3] == 'm') {
-        if (argc < 3) goto do_exit;
-        ioctl_arg = argv[2];
-        ioctl_code = IOCTL_DEL_MAPS_PATTERN;
-    }
     /* status - Show module status (userspace check) */
-    else if (cmd == 's' && argv[1][1] == 't' && argv[1][2] == 'a') {
+    if (cmd == 's' && argv[1][1] == 't' && argv[1][2] == 'a') {
         int ver = 0;
         ioctl_arg = &ver;
         long res = sys3(SYS_IOCTL, fd, IOCTL_VER, (long)ioctl_arg);
@@ -263,14 +214,6 @@ void c_main(long *sp) {
         ioctl_code = IOCTL_LIST;
         ioctl_arg = (void *)list_buffer;
     }
-    /* clrhide - Clear all hidden mounts */
-    else if (cmd == 'c' && argv[1][1] == 'l' && argv[1][2] == 'r' && argv[1][3] == 'h') {
-        ioctl_code = IOCTL_CLEAR_HIDDEN_MOUNTS;
-    }
-    /* clrmap - Clear all maps patterns */
-    else if (cmd == 'c' && argv[1][1] == 'l' && argv[1][2] == 'r' && argv[1][3] == 'm') {
-        ioctl_code = IOCTL_CLEAR_MAPS_PATTERNS;
-    }
     /* enable - Enable NoMount hooks (module starts disabled to prevent boot deadlock) */
     else if (cmd == 'e' && argv[1][1] == 'n') {
         ioctl_code = IOCTL_ENABLE;
@@ -279,42 +222,8 @@ void c_main(long *sp) {
     else if (cmd == 'd' && argv[1][1] == 'i' && argv[1][2] == 's') {
         ioctl_code = IOCTL_DISABLE;
     }
-    /* unhide <mount_id> - Unhide mount */
-    else if (cmd == 'u' && argv[1][1] == 'n' && argv[1][2] == 'h') {
-        if (argc < 3) goto do_exit;
-        int mount_id;
-        if (parse_int(argv[2], &mount_id) < 0) goto do_exit;
-        int_buffer = mount_id;
-        ioctl_arg = &int_buffer;
-        ioctl_code = IOCTL_UNHIDE_MOUNT;
-    }
-    /* hide <mount_id> - Hide mount from /proc/mounts */
-    else if (cmd == 'h' && argv[1][1] == 'i') {
-        if (argc < 3) goto do_exit;
-        int mount_id;
-        if (parse_int(argv[2], &mount_id) < 0) goto do_exit;
-        int_buffer = mount_id;
-        ioctl_arg = &int_buffer;
-        ioctl_code = IOCTL_HIDE_MOUNT;
-    }
-    /* setdev <partition_id> <major> <minor> - Set partition device numbers */
-    else if (cmd == 's' && argv[1][1] == 'e' && argv[1][2] == 't') {
-        if (argc < 5) goto do_exit;
 
-        /* Parse partition_id */
-        if (parse_int(argv[2], &pd_buffer.partition_id) < 0) goto do_exit;
-
-        /* Parse major */
-        if (parse_uint(argv[3], &pd_buffer.dev_major) < 0) goto do_exit;
-
-        /* Parse minor */
-        if (parse_uint(argv[4], &pd_buffer.dev_minor) < 0) goto do_exit;
-
-        ioctl_arg = &pd_buffer;
-        ioctl_code = IOCTL_SET_PARTITION_DEV;
-    }
-
-    /* ========== ORIGINAL COMMANDS ========== */
+    /* ========== CORE VFS COMMANDS ========== */
 
     else if (cmd == 'a' || cmd == 'd') {
         #if defined(__aarch64__)
@@ -370,11 +279,6 @@ void c_main(long *sp) {
             }
             ioctl_code = IOCTL_ADD;
         }
-    }
-    else if (cmd == 'b' || cmd == 'u') {
-        if (parse_uint(argv[2], &uid) < 0) goto do_exit;
-        ioctl_arg = &uid;
-        ioctl_code = (cmd == 'b') ? IOCTL_ADD_UID : IOCTL_DEL_UID;
     }
     else if (cmd == 'c') {
         ioctl_code = IOCTL_CLEAR;

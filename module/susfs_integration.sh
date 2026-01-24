@@ -45,6 +45,7 @@ HAS_SUS_PATH=0
 HAS_SUS_PATH_LOOP=0
 HAS_SUS_MOUNT=0
 HAS_SUS_KSTAT=0
+HAS_SUS_KSTAT_REDIRECT=0
 HAS_SUS_MAPS=0
 
 # Metadata cache directory
@@ -121,12 +122,26 @@ susfs_init() {
         HAS_SUS_KSTAT=1
         log_debug "Capability detected: add_sus_kstat_statically"
     fi
+    if echo "$help_output" | grep -q "add_sus_kstat_redirect"; then
+        HAS_SUS_KSTAT_REDIRECT=1
+        log_debug "Capability detected: add_sus_kstat_redirect"
+    fi
     if echo "$help_output" | grep -q "add_sus_map"; then
         HAS_SUS_MAPS=1
         log_debug "Capability detected: add_sus_map"
     fi
 
-    log_info "Capabilities: path=$HAS_SUS_PATH loop=$HAS_SUS_PATH_LOOP mount=$HAS_SUS_MOUNT kstat=$HAS_SUS_KSTAT maps=$HAS_SUS_MAPS"
+    # Export variables so subshells (find | while loops) can access them
+    export SUSFS_BIN
+    export HAS_SUSFS
+    export HAS_SUS_PATH
+    export HAS_SUS_PATH_LOOP
+    export HAS_SUS_MOUNT
+    export HAS_SUS_KSTAT
+    export HAS_SUS_KSTAT_REDIRECT
+    export HAS_SUS_MAPS
+
+    log_info "Capabilities: path=$HAS_SUS_PATH loop=$HAS_SUS_PATH_LOOP mount=$HAS_SUS_MOUNT kstat=$HAS_SUS_KSTAT kstat_redirect=$HAS_SUS_KSTAT_REDIRECT maps=$HAS_SUS_MAPS"
 
     # Find config directory
     log_debug "Searching for SUSFS config directory..."
@@ -493,9 +508,9 @@ EOF
         log_debug "Parsed: ino=$ino dev=$dev nlink=$nlink size=$size"
     fi
 
-    # Apply kstat spoofing - use redirect API if rpath provided
+    # Apply kstat spoofing - use redirect API if rpath provided and capability exists
     local result rc cmd
-    if [ -n "$rpath" ]; then
+    if [ -n "$rpath" ] && [ "$HAS_SUS_KSTAT_REDIRECT" = "1" ]; then
         cmd="add_sus_kstat_redirect"
         log_susfs_cmd "$cmd" "$vpath $rpath ino=$ino dev=$dev"
         result=$("$SUSFS_BIN" "$cmd" "$vpath" "$rpath" \
@@ -933,6 +948,7 @@ susfs_status() {
         echo "  sus_path_loop: $HAS_SUS_PATH_LOOP"
         echo "  sus_mount:     $HAS_SUS_MOUNT"
         echo "  sus_kstat:     $HAS_SUS_KSTAT"
+        echo "  kstat_redirect: $HAS_SUS_KSTAT_REDIRECT"
         echo "  sus_maps:      $HAS_SUS_MAPS"
         echo ""
         echo "Config Directory: ${SUSFS_CONFIG_DIR:-none}"

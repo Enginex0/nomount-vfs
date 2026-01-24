@@ -1326,16 +1326,10 @@ index 000000000..43ca3f0fa
 +	}
 +
 +	/*
-+	 * PHASE 2: Prefix fallback - path starts with system partition prefix
-+	 * This handles files that don't have explicit rules but should still
-+	 * appear to be on system partitions (e.g., /system/fonts/X.ttf).
++	 * PHASE 2: DISABLED - prefix fallback was spoofing ALL overlay paths
++	 * including system overlays (mi_ext), breaking Android linker namespace.
++	 * Only spoof paths with explicit VFS rules (rule_matched == true).
 +	 */
-+	if (!rule_matched) {
-+		pr_info("nomount: [SPOOF_STAT_DEV] PHASE2: prefix fallback (no rule matched)\n");
-+		expected_dev = nomount_get_partition_dev_for_path(path);
-+		pr_info("nomount: [SPOOF_STAT_DEV] PHASE2 result: expected_dev=%u:%u\n",
-+			MAJOR(expected_dev), MINOR(expected_dev));
-+	}
 +
 +	/* Apply spoofing if we found a device to spoof to */
 +	pr_info("nomount: [SPOOF_STAT_DEV] ============ DECISION ============\n");
@@ -1449,10 +1443,7 @@ index 000000000..43ca3f0fa
 +	}
 +	rcu_read_unlock();
 +
-+	/* Phase 2: Fallback to prefix-based lookup (OUTSIDE RCU - can sleep) */
-+	if (expected_dev == 0) {
-+		expected_dev = nomount_get_partition_dev_for_path(pathbuf);
-+	}
++	/* Phase 2: DISABLED - was spoofing all overlay paths, breaking linker namespace */
 +
 +	if (expected_dev != 0 && stat->dev != expected_dev) {
 +		pr_info("nomount: [SYSCALL_SPOOF] SPOOFING %s dev %u:%u->%u:%u\n",

@@ -300,6 +300,10 @@ fi
 
 echo "" >> "$LOG_FILE"
 
+# EARLY EXIT REMOVED - Staged rollout enabled
+# Phase 1: VFS file registration only (nm enable + process_modules_direct)
+# Phase 2: Hidden mounts and maps patterns (DISABLED - testing required)
+
 # ============================================================
 # FUNCTION: Check if module is excluded (by name)
 # ============================================================
@@ -506,13 +510,17 @@ register_sus_map_for_module() {
 
     for partition in $TARGET_PARTITIONS; do
         if [ -d "$mod_path/$partition" ]; then
-            find "$mod_path/$partition" -name "*.so" -type f 2>/dev/null | while read -r so_file; do
+            # Avoid pipe subshell - use temp file so counter updates persist
+            _so_tmp="$NOMOUNT_DATA/.so_files_$$"
+            find "$mod_path/$partition" -name "*.so" -type f 2>/dev/null > "$_so_tmp"
+            while read -r so_file; do
                 if ksu_susfs add_sus_map "$so_file" < /dev/null 2>/dev/null; then
                     so_count=$((so_count + 1))
                 else
                     log_err "SUS_MAP failed: $so_file"
                 fi
-            done
+            done < "$_so_tmp"
+            rm -f "$_so_tmp"
         fi
     done
 }
@@ -539,7 +547,10 @@ register_module_vfs() {
 
     for partition in $TARGET_PARTITIONS; do
         if [ -d "$mod_path/$partition" ]; then
-            find "$mod_path/$partition" -type f -o -type c 2>/dev/null | while read -r real_path; do
+            # Avoid pipe subshell - use temp file so SUSFS functions run in main shell
+            _vfs_tmp="$NOMOUNT_DATA/.vfs_files_$$"
+            find "$mod_path/$partition" -type f -o -type c 2>/dev/null > "$_vfs_tmp"
+            while read -r real_path; do
                 virtual_path="${real_path#$mod_path}"
 
                 # Skip marker files
@@ -581,7 +592,8 @@ register_module_vfs() {
 
                 echo "$f_cnt $s_cnt $w_cnt" > "$count_file"
                 echo "$virtual_path" >> "$tracking_file"
-            done
+            done < "$_vfs_tmp"
+            rm -f "$_vfs_tmp"
         fi
     done
 
@@ -700,110 +712,14 @@ process_modules_direct() {
     log_info "Direct processing complete: $ACTIVE_MODULES_COUNT modules"
 }
 
-# ============================================================
-# PHASE 1: Cache partition device IDs (SUSFS-independent)
-# Must run EARLY before overlays change device IDs
-# ============================================================
-cache_partition_devs() {
-    log_info "Phase 1: Caching partition device IDs..."
-
-    local part_id=0
-    local cached_count=0
-
-    for partition in system vendor product system_ext odm oem mi_ext my_heytap prism optics oem_dlkm system_dlkm vendor_dlkm; do
-        if [ -d "/$partition" ]; then
-            local dev_dec=$(stat -c '%d' "/$partition" 2>/dev/null)
-            if [ -n "$dev_dec" ] && [ "$dev_dec" -gt 0 ]; then
-                local major=$((dev_dec >> 8))
-                local minor=$((dev_dec & 255))
-                if "$LOADER" setdev "$part_id" "$major" "$minor" 2>/dev/null; then
-                    cached_count=$((cached_count + 1))
-                else
-                    log_err "setdev failed for /$partition"
-                fi
-            fi
-        fi
-        part_id=$((part_id + 1))
-    done
-
-    log_info "Phase 1 complete: $cached_count partitions cached"
-}
-
-# ============================================================
-# PHASE 2: Register hidden mounts (SUSFS-independent)
-# Hides overlay/tmpfs mounts from /proc/mounts, /proc/self/mountinfo
-# ============================================================
-register_hidden_mounts() {
-    log_info "Phase 2: Registering hidden mounts..."
-
-    local count=0
-    local fail_count=0
-
-    while IFS=' ' read -r mount_id rest; do
-        local fstype=$(echo "$rest" | sed 's/.* - //' | cut -d' ' -f1)
-        local mount_point=$(echo "$rest" | cut -d' ' -f4)
-
-        case "$fstype" in
-            overlay|tmpfs)
-                for partition in $TARGET_PARTITIONS; do
-                    if echo "$mount_point" | grep -qE "^/$partition(/|$)"; then
-                        if "$LOADER" hide "$mount_id" 2>/dev/null; then
-                            count=$((count + 1))
-                        else
-                            log_err "Failed to hide mount $mount_id ($mount_point)"
-                            fail_count=$((fail_count + 1))
-                        fi
-                        break
-                    fi
-                done
-                ;;
-        esac
-    done < /proc/self/mountinfo
-
-    log_info "Phase 2 complete: $count mounts hidden"
-}
-
-# ============================================================
-# PHASE 3: Register maps patterns (SUSFS-independent)
-# Hides suspicious paths from /proc/self/maps
-# ============================================================
-register_maps_patterns() {
-    log_info "Phase 3: Registering maps patterns..."
-
-    local count=0
-    for pattern in "/data/adb" "magisk" "kernelsu" "zygisk"; do
-        if "$LOADER" addmap "$pattern" 2>/dev/null; then
-            count=$((count + 1))
-        else
-            log_err "Failed to register maps pattern: $pattern"
-        fi
-    done
-
-    log_info "Phase 3 complete: $count patterns registered"
-}
+# REMOVED: cache_partition_devs, register_hidden_mounts, register_maps_patterns
+# These used nm setdev/hide/addmap which are obsolete - SUSFS handles all of this now
 
 # ============================================================
 # MAIN EXECUTION (late boot phase)
 # ============================================================
 log_info "========== MAIN EXECUTION =========="
 log_info "Config: universal_hijack=$universal_hijack, aggressive_mode=$aggressive_mode"
-
-# ============================================================
-# SUSFS-INDEPENDENT VFS HIDING (Phases 1-3)
-# These run BEFORE file registration for complete detection evasion
-# ============================================================
-log_info "========== SUSFS-INDEPENDENT VFS HIDING =========="
-cache_partition_devs
-register_hidden_mounts
-register_maps_patterns
-
-# NOTE: We intentionally do NOT call "nm clear" here.
-# Clearing rules creates a race condition where fonts/libraries become
-# temporarily inaccessible, causing apps like Gboard to crash.
-# Instead, we register new rules (which overwrite old ones) and let
-# save_rule_cache() generate a clean cache at the end. Orphaned rules
-# for removed/disabled modules are harmless until next boot.
-# See: https://github.com/user/nomount/issues/XXX
 
 # Cache /proc/mounts BEFORE enabling hooks (prevents kernel deadlock)
 CACHED_PROC_MOUNTS=$(cat /proc/mounts 2>/dev/null)
@@ -848,20 +764,6 @@ EOF
 else
     log_info "========== STANDARD MODE =========="
     process_modules_direct
-fi
-
-# Handle UID exclusion list
-if [ -f "$NOMOUNT_DATA/.exclusion_list" ]; then
-    uid_count=0
-    while IFS= read -r uid; do
-        [ -z "$uid" ] && continue
-        if "$LOADER" blk "$uid" 2>/dev/null; then
-            uid_count=$((uid_count + 1))
-        else
-            log_err "Failed to block UID: $uid"
-        fi
-    done < "$NOMOUNT_DATA/.exclusion_list"
-    [ "$uid_count" -gt 0 ] && log_info "UIDs blocked: $uid_count"
 fi
 
 # Calculate execution time
@@ -945,24 +847,6 @@ save_rule_cache() {
         filtered_count=$(grep -c "FILTER" "$filter_count_file" 2>/dev/null || echo 0)
         rm -f "$filter_count_file"
     fi
-
-    # Cache partition device IDs
-    local part_id=0
-    for partition in system vendor product system_ext odm oem mi_ext my_heytap prism optics oem_dlkm system_dlkm vendor_dlkm; do
-        if [ -d "/$partition" ]; then
-            local dev_dec=$(stat -c '%d' "/$partition" 2>/dev/null)
-            if [ -n "$dev_dec" ] && [ "$dev_dec" -gt 0 ]; then
-                local major=$((dev_dec >> 8))
-                local minor=$((dev_dec & 255))
-                echo "setdev|$part_id|$major:$minor" >> "$temp_file"
-            fi
-        fi
-        part_id=$((part_id + 1))
-    done
-
-    for pattern in "/data/adb" "magisk" "kernelsu" "zygisk"; do
-        echo "addmap|$pattern|" >> "$temp_file"
-    done
 
     # Deduplicate and save
     local dedup_file="$NOMOUNT_DATA/.rule_cache_dedup_$$"
