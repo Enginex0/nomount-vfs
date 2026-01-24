@@ -14,20 +14,20 @@
  		}
 @@ -558,6 +561,15 @@ static int nomount_cache_partition_metadata(struct nomount_rule *rule)
 
- 		ret = kern_path(parent_path, LOOKUP_FOLLOW, &vpath);
- 		if (ret == 0) {
-+			/* Verify kern_path() returned valid mount/dentry/sb */
-+			if (!vpath.mnt || !vpath.dentry || !vpath.dentry->d_sb) {
-+				NM_DBG("cache_metadata: kern_path succeeded but invalid vpath components (mnt=%p dentry=%p sb=%p)\n",
-+					vpath.mnt, vpath.dentry, vpath.dentry ? vpath.dentry->d_sb : NULL);
-+				path_put(&vpath);
-+				parent_depth++;
-+				continue;
-+			}
+ 			ret = kern_path(parent_path, LOOKUP_FOLLOW, &vpath);
+ 			if (ret == 0) {
++				/* Verify kern_path() returned valid mount/dentry/sb */
++				if (!vpath.mnt || !vpath.dentry || !vpath.dentry->d_sb) {
++					NM_DBG("cache_metadata: kern_path succeeded but invalid vpath components (mnt=%p dentry=%p sb=%p)\n",
++						vpath.mnt, vpath.dentry, vpath.dentry ? vpath.dentry->d_sb : NULL);
++					path_put(&vpath);
++					parent_depth++;
++					continue;
++				}
 +
- 			/* Found existing parent! Cache its statfs */
- 			rule->cached_partition_dev = vpath.dentry->d_sb->s_dev;
- 			mnt_path.mnt = vpath.mnt;
+ 				/* Found existing parent! Cache its statfs */
+ 				rule->cached_partition_dev = vpath.dentry->d_sb->s_dev;
+ 				mnt_path.mnt = vpath.mnt;
 @@ -641,6 +653,12 @@ char *nomount_get_virtual_path_for_inode(struct inode *inode) {
  	char *found_path = NULL;
 
@@ -37,24 +37,37 @@
 +		NM_DBG("get_vpath: null i_sb for inode=%p, skipping\n", inode);
 +		return NULL;
 +	}
++
  	if (nomount_is_uid_blocked(current_uid().val)) return NULL;
  	NOMOUNT_HOOK_ENTER_RET(NULL);  /* Recursion guard */
 
-@@ -952,7 +970,11 @@ static void nomount_lazy_resolve_real_ino(void)
+@@ -952,20 +970,22 @@ static void nomount_lazy_resolve_real_ino(void)
  		return;
 
  	if (kern_path(rpath, LOOKUP_FOLLOW, &path) == 0) {
 -		if (path.dentry && d_backing_inode(path.dentry)) {
-+		/* Verify all pointer components are valid before dereferencing */
 +		if (path.dentry && path.dentry->d_sb && d_backing_inode(path.dentry)) {
  			ino_t resolved_ino = d_backing_inode(path.dentry)->i_ino;
  			dev_t resolved_dev = path.dentry->d_sb->s_dev;
+
+ 			spin_lock(&nomount_lock);
+ 			hash_for_each_rcu(nomount_rules_ht, bkt, rule, node) {
+ 				if (rule->real_path && strcmp(rule->real_path, rpath) == 0 &&
+ 				    rule->real_ino == 0) {
+ 					rule->real_ino = resolved_ino;
+ 					rule->real_dev = resolved_dev;
+ 					pr_info("nomount: [LAZY_RESOLVE] %s -> ino=%lu dev=%u:%u\n",
+ 						rpath, resolved_ino, MAJOR(resolved_dev), MINOR(resolved_dev));
+ 					break;
+ 				}
+ 			}
+ 			spin_unlock(&nomount_lock);
 +		} else {
 +			NM_DBG("lazy_resolve: kern_path succeeded but invalid components for %s\n", rpath);
  		}
  		path_put(&path);
  	}
-@@ -1318,6 +1340,12 @@ void nomount_syscall_spoof_stat(int dfd, const char __user *filename, struct ks
+@@ -1318,6 +1338,12 @@ void nomount_syscall_spoof_stat(int dfd, const char __user *filename, struct ks
  		return;
 
  	len = strncpy_from_user(pathbuf, filename, sizeof(pathbuf));
