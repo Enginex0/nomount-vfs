@@ -1053,7 +1053,7 @@ index 000000000..43ca3f0fa
 +	dev_t matched_dev = 0;
 +	ino_t matched_vino = 0;
 +	dev_t orig_dev;
-+	ino_t orig_ino;
++	u64 orig_ino;
 +	bool found = false;
 +
 +	pr_info("nomount: [SPOOF_STAT] ENTER inode=%p stat=%p\n", inode, stat);
@@ -1122,10 +1122,10 @@ index 000000000..43ca3f0fa
 +		orig_ino = stat->ino;
 +		stat->dev = matched_dev;
 +		stat->ino = matched_vino;
-+		pr_info("nomount: [SPOOF_STAT] SPOOFED: dev=%u:%u->%u:%u ino=%lu->%lu\n",
++		pr_info("nomount: [SPOOF_STAT] SPOOFED: dev=%u:%u->%u:%u ino=%llu->%llu\n",
 +			MAJOR(orig_dev), MINOR(orig_dev), MAJOR(stat->dev), MINOR(stat->dev),
 +			orig_ino, stat->ino);
-+		NM_INFO("spoof_stat: spoofed dev=%u->%u ino=%lu->%lu\n",
++		NM_INFO("spoof_stat: spoofed dev=%u->%u ino=%llu->%llu\n",
 +			orig_dev, stat->dev, orig_ino, stat->ino);
 +		if (vpath_copy) {
 +			nomount_get_parent_timestamps(vpath_copy, stat);
@@ -1168,13 +1168,13 @@ index 000000000..43ca3f0fa
 +	struct nomount_rule *rule;
 +	dev_t expected_dev = 0;
 +	dev_t orig_dev;
-+	ino_t orig_ino;
++	u64 orig_ino;
 +	bool rule_matched = false;
 +
 +	/* UNCONDITIONAL DEBUG - trace every step */
 +	pr_info("nomount: [SPOOF_STAT_DEV] ============ ENTER ============\n");
 +	pr_info("nomount: [SPOOF_STAT_DEV] path=%s\n", path ? path : "(null)");
-+	pr_info("nomount: [SPOOF_STAT_DEV] stat->dev=%u:%u stat->ino=%lu\n",
++	pr_info("nomount: [SPOOF_STAT_DEV] stat->dev=%u:%u stat->ino=%llu\n",
 +		stat ? MAJOR(stat->dev) : 0, stat ? MINOR(stat->dev) : 0, stat ? stat->ino : 0);
 +	pr_info("nomount: [SPOOF_STAT_DEV] caller uid=%u pid=%d comm=%s\n",
 +		current_uid().val, current->pid, current->comm);
@@ -1311,7 +1311,7 @@ index 000000000..43ca3f0fa
 +		pr_info("nomount: [SPOOF_STAT_DEV] path=%s\n", path);
 +		pr_info("nomount: [SPOOF_STAT_DEV] dev: %u:%u -> %u:%u\n",
 +			MAJOR(orig_dev), MINOR(orig_dev), MAJOR(stat->dev), MINOR(stat->dev));
-+		pr_info("nomount: [SPOOF_STAT_DEV] ino: %lu -> %lu\n", orig_ino, stat->ino);
++		pr_info("nomount: [SPOOF_STAT_DEV] ino: %llu -> %llu\n", orig_ino, stat->ino);
 +
 +		/* Copy timestamps from parent directory for consistency */
 +		nomount_get_parent_timestamps(path, stat);
