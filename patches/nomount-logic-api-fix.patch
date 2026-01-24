@@ -1,5 +1,5 @@
---- fs/vfs_dcache.c.before-logic	2026-01-24 11:08:36.284515368 +0100
-+++ fs/vfs_dcache.c	2026-01-24 11:08:51.008415916 +0100
+--- a/fs/vfs_dcache.c
++++ b/fs/vfs_dcache.c
 @@ -2009,7 +2009,7 @@
  	dir_path = d_path(&file->f_path, page_buf, PAGE_SIZE);
  	if (IS_ERR(dir_path)) {
