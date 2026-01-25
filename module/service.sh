@@ -619,20 +619,17 @@ register_module_vfs() {
 }
 
 # ============================================================
-# FUNCTION: Hijack a single mount (any type)
+# FUNCTION: Register VFS rules for a mount target (Phase 1)
+# Returns module path via echo for unmount phase
 # ============================================================
-hijack_mount() {
+register_mount_vfs() {
     local mount_info="$1"
     local mount_type="${mount_info%%:*}"
     local mountpoint="${mount_info#*:}"
 
-    log_info "Hijacking $mount_type mount: $mountpoint"
-
-    # For overlay mounts, verify it's from a module, not Android system
     if [ "$mount_type" = "overlay" ]; then
         if ! is_module_overlay "$mountpoint"; then
-            log_info "SKIP: System overlay - preserving"
-            return 0
+            return 1
         fi
     fi
 
@@ -658,19 +655,26 @@ hijack_mount() {
             ;;
     esac
 
-    if [ -z "$mod_name" ]; then
-        log_err "Could not determine owning module for mount: $mountpoint"
-        return 1
-    fi
+    [ -z "$mod_name" ] && return 1
 
     local mod_path="$MODULES_DIR/$mod_name"
 
-    is_excluded "$mod_name" && { log_info "SKIP: $mod_name excluded"; return 0; }
-    should_skip_module "$mod_path" "$mod_name" && return 0
-    [ ! -d "$mod_path" ] && { log_err "Module directory not found: $mod_path"; return 1; }
+    is_excluded "$mod_name" && return 1
+    should_skip_module "$mod_path" "$mod_name" && return 1
+    [ ! -d "$mod_path" ] && return 1
 
     PROCESSED_MODULES="$PROCESSED_MODULES $mod_name "
     register_module_vfs "$mod_path" "$mod_name"
+    log_info "Registered VFS for mount target: $mountpoint ($mod_name)"
+    return 0
+}
+
+# ============================================================
+# FUNCTION: Unmount a hijacked mount (Phase 2)
+# ============================================================
+unmount_hijacked() {
+    local mount_info="$1"
+    local mountpoint="${mount_info#*:}"
 
     local umount_output
     umount_output=$(umount -l "$mountpoint" 2>&1)
@@ -732,6 +736,7 @@ CACHED_PROC_MOUNTS=$(cat /proc/mounts 2>/dev/null)
 export CACHED_PROC_MOUNTS
 
 mount_list=""
+mounts_to_unmount=""
 if [ "$universal_hijack" = "true" ]; then
     log_info "========== UNIVERSAL HIJACKER MODE =========="
     mount_list=$(detect_all_module_mounts)
@@ -739,7 +744,31 @@ if [ "$universal_hijack" = "true" ]; then
     log_info "Detected $mount_count module-related mounts"
 fi
 
-# Enable NoMount hooks - after mount detection is complete
+# ============================================================
+# PHASE 1: Register ALL VFS rules (NoMount DISABLED)
+# This ensures kern_path sees real /system paths, caching correct device IDs
+# ============================================================
+log_info "PHASE 1: Registering VFS rules (NoMount disabled)"
+
+if [ "$universal_hijack" = "true" ] && [ -n "$mount_list" ]; then
+    while read -r mount_info; do
+        if [ -n "$mount_info" ]; then
+            if register_mount_vfs "$mount_info"; then
+                mounts_to_unmount="$mounts_to_unmount$mount_info
+"
+            fi
+        fi
+    done <<EOF
+$mount_list
+EOF
+fi
+
+process_modules_direct
+
+# ============================================================
+# PHASE 2: Enable NoMount hooks
+# ============================================================
+log_info "PHASE 2: Enabling NoMount hooks"
 if "$LOADER" enable < /dev/null 2>/dev/null; then
     log_info "NoMount VFS hooks ENABLED"
 else
@@ -747,29 +776,29 @@ else
     exit 1
 fi
 
-if [ "$universal_hijack" = "true" ]; then
-    if [ -n "$mount_list" ]; then
-        hijack_success=0
-        hijack_fail=0
+# ============================================================
+# PHASE 3: Unmount hijacked mounts (NoMount ENABLED)
+# ============================================================
+if [ "$universal_hijack" = "true" ] && [ -n "$mounts_to_unmount" ]; then
+    log_info "PHASE 3: Unmounting hijacked mounts"
+    hijack_success=0
+    hijack_fail=0
 
-        while read -r mount_info; do
-            if [ -n "$mount_info" ]; then
-                if hijack_mount "$mount_info"; then
-                    hijack_success=$((hijack_success + 1))
-                else
-                    hijack_fail=$((hijack_fail + 1))
-                fi
+    while read -r mount_info; do
+        if [ -n "$mount_info" ]; then
+            if unmount_hijacked "$mount_info"; then
+                hijack_success=$((hijack_success + 1))
+            else
+                hijack_fail=$((hijack_fail + 1))
             fi
-        done <<EOF
-$mount_list
+        fi
+    done <<EOF
+$mounts_to_unmount
 EOF
 
-        log_info "Hijacking complete: $hijack_success ok, $hijack_fail failed"
-    fi
-    process_modules_direct
+    log_info "Hijacking complete: $hijack_success ok, $hijack_fail failed"
 else
-    log_info "========== STANDARD MODE =========="
-    process_modules_direct
+    log_info "Standard mode - no mounts to hijack"
 fi
 
 # Late kstat pass - retry deferred entries now that boot has settled

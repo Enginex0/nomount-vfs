@@ -1742,12 +1742,14 @@ index 000000000..43ca3f0fa
 +		return NULL;
 +	}
 +
-+	NM_DBG("resolve_path: looking up %s\n", pathname);
-+	hash = full_name_hash(NULL, pathname, strlen(pathname));
++	/* Normalize path before hash lookup to match how rules are stored */
++	const char *norm_path = nomount_normalize_path(pathname);
++	NM_DBG("resolve_path: looking up %s (normalized: %s)\n", pathname, norm_path);
++	hash = full_name_hash(NULL, norm_path, strlen(norm_path));
 +
 +	rcu_read_lock();
 +	hash_for_each_possible_rcu(nomount_rules_ht, rule, node, hash) {
-+		if (nomount_match_path(pathname, rule->virtual_path)) {
++		if (nomount_match_path(norm_path, rule->virtual_path)) {
 +			if (rule->flags & NM_FLAG_ACTIVE) {
 +				target = kstrdup(rule->real_path, GFP_ATOMIC);
 +				if (target) {
@@ -2398,11 +2400,13 @@ index 000000000..43ca3f0fa
 +		return PTR_ERR(v_path);
 +	}
 +
-+	NM_INFO("del_rule: vpath=%s\n", v_path);
++	/* Normalize path for consistent comparison with stored rules */
++	const char *norm_vpath = nomount_normalize_path(v_path);
++	NM_INFO("del_rule: vpath=%s (normalized: %s)\n", v_path, norm_vpath);
 +
 +	spin_lock(&nomount_lock);
 +	hash_for_each_safe(nomount_rules_ht, bkt, tmp, rule, node) {
-+		if (strcmp(rule->virtual_path, v_path) == 0) {
++		if (strcmp(rule->virtual_path, norm_vpath) == 0) {
 +			NM_DBG("del_rule: found rule at bucket %d\n", bkt);
 +			hash_del_rcu(&rule->node);
 +			hash_del_rcu(&rule->target_node);  /* Remove from reverse hash table */

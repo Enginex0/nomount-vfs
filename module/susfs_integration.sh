@@ -194,9 +194,9 @@ susfs_classify_path() {
             actions="$actions,sus_kstat"
             log_debug "Classified as BINARY: $vpath"
             ;;
-        # Fonts and media
+        # Fonts and media - only kstat (must remain visible to apps)
         /system/fonts/*|/system/media/*|/product/fonts/*|/product/media/*)
-            actions="$actions,sus_kstat"
+            actions="sus_kstat"
             log_debug "Classified as MEDIA/FONT: $vpath"
             ;;
         # Apps - may need mount hiding
@@ -466,15 +466,38 @@ susfs_apply_kstat() {
         return 0
     fi
 
-    if [ -z "$metadata" ]; then
-        log_debug "No metadata provided"
-        log_func_exit "susfs_apply_kstat" "1" "no metadata"
-        return 1
-    fi
-
     local ino dev nlink size atime mtime ctime blocks blksize fstype
 
-    if [ "${metadata%%|*}" = "NEW" ]; then
+    if [ -z "$metadata" ]; then
+        # No cached metadata - derive device ID from parent directory
+        log_debug "No cached metadata, deriving from parent directory"
+        local parent
+        parent=$(dirname "$vpath")
+        local parent_stat
+        parent_stat=$(stat -c '%i|%d|%h|%s|%X|%Y|%Z|%b|%B' "$parent" 2>/dev/null)
+        if [ -z "$parent_stat" ]; then
+            log_warn "Cannot stat parent $parent for $vpath"
+            log_func_exit "susfs_apply_kstat" "1" "no parent"
+            return 1
+        fi
+        # Use parent's device ID, generate unique inode
+        IFS='|' read -r _ dev _ _ atime mtime ctime _ blksize <<EOF
+$parent_stat
+EOF
+        ino=$(($(date +%s%N 2>/dev/null || date +%s) % 2147483647))
+        nlink=1
+        # Get actual size from real file
+        if [ -n "$rpath" ] && [ -f "$rpath" ]; then
+            local real_stat=$(stat -c '%s|%b' "$rpath" 2>/dev/null)
+            size=$(echo "$real_stat" | cut -d'|' -f1)
+            blocks=$(echo "$real_stat" | cut -d'|' -f2)
+        else
+            size=0
+            blocks=0
+        fi
+        [ -z "$blksize" ] && blksize=4096
+        log_info "Derived kstat: dev=$dev from parent $parent"
+    elif [ "${metadata%%|*}" = "NEW" ]; then
         # Synthesize metadata from parent directory
         log_debug "Synthesizing metadata for NEW file"
         local parent
@@ -508,9 +531,47 @@ EOF
         log_debug "Parsed: ino=$ino dev=$dev nlink=$nlink size=$size"
     fi
 
+    # CRITICAL: Always derive dev from parent directory - cached metadata may be wrong
+    # because KernelSU mounts overlays before our metadata capture runs
+    local parent_dev
+    parent_dev=$(stat -c '%d' "$(dirname "$vpath")" 2>/dev/null)
+    if [ -n "$parent_dev" ] && [ "$parent_dev" != "$dev" ]; then
+        log_info "Device ID override: $dev -> $parent_dev (from parent directory)"
+        dev="$parent_dev"
+    fi
+
     # Apply kstat spoofing - use redirect API if rpath provided and capability exists
     local result rc cmd
     if [ -n "$rpath" ] && [ "$HAS_SUS_KSTAT_REDIRECT" = "1" ]; then
+        # Use actual size/blocks from replacement file (cached size may differ)
+        local real_stat
+        real_stat=$(stat -c '%s|%b|%B' "$rpath" 2>/dev/null)
+        if [ -n "$real_stat" ]; then
+            size=$(echo "$real_stat" | cut -d'|' -f1)
+            blocks=$(echo "$real_stat" | cut -d'|' -f2)
+            blksize=$(echo "$real_stat" | cut -d'|' -f3)
+            log_info "Kstat size override: $size (from $rpath)"
+        else
+            log_warn "Stat failed for $rpath - using cached metadata, deferring for retry"
+            echo "$vpath|$metadata|$rpath" >> "$NOMOUNT_DATA/.deferred_kstat" 2>/dev/null
+            cmd="add_sus_kstat_statically"
+            log_susfs_cmd "$cmd" "$vpath ino=$ino dev=$dev (cached)"
+            result=$("$SUSFS_BIN" "$cmd" "$vpath" \
+                "$ino" "$dev" "$nlink" "$size" \
+                "$atime" 0 "$mtime" 0 "$ctime" 0 \
+                "$blocks" "$blksize" 2>&1)
+            rc=$?
+            log_susfs_result "$rc" "$cmd" "$vpath"
+            if [ $rc -eq 0 ]; then
+                SUSFS_STATS_KSTAT=$((SUSFS_STATS_KSTAT + 1))
+                log_func_exit "susfs_apply_kstat" "0" "cached fallback"
+                return 0
+            fi
+            log_err "$cmd fallback failed: $result"
+            SUSFS_STATS_ERRORS=$((SUSFS_STATS_ERRORS + 1))
+            log_func_exit "susfs_apply_kstat" "1"
+            return 1
+        fi
         cmd="add_sus_kstat_redirect"
         log_susfs_cmd "$cmd" "$vpath $rpath ino=$ino dev=$dev"
         result=$("$SUSFS_BIN" "$cmd" "$vpath" "$rpath" \
@@ -539,6 +600,54 @@ EOF
         log_func_exit "susfs_apply_kstat" "1"
         return 1
     fi
+}
+
+# Re-apply kstat for deferred entries after boot settles
+late_kstat_pass() {
+    log_func_enter "late_kstat_pass"
+    local deferred="$NOMOUNT_DATA/.deferred_kstat"
+    [ ! -f "$deferred" ] && { log_debug "No deferred kstat entries"; log_func_exit "late_kstat_pass" "0"; return 0; }
+    [ "$HAS_SUSFS" != "1" ] && { rm -f "$deferred"; return 0; }
+
+    local ok=0 fail=0
+    while IFS='|' read -r vpath metadata rpath; do
+        [ -z "$vpath" ] && continue
+        local real_stat=$(stat -c '%s|%b|%B' "$rpath" 2>/dev/null)
+        if [ -z "$real_stat" ]; then
+            log_warn "Late kstat: still cannot stat $rpath"
+            fail=$((fail+1))
+            continue
+        fi
+
+        local size=$(echo "$real_stat" | cut -d'|' -f1)
+        local blocks=$(echo "$real_stat" | cut -d'|' -f2)
+        local blksize=$(echo "$real_stat" | cut -d'|' -f3)
+        local ino dev nlink atime mtime ctime
+        IFS='|' read -r ino dev nlink _ atime mtime ctime _ _ _ <<EOF
+$metadata
+EOF
+
+        if [ "$HAS_SUS_KSTAT_REDIRECT" = "1" ]; then
+            if "$SUSFS_BIN" add_sus_kstat_redirect "$vpath" "$rpath" \
+                "$ino" "$dev" "$nlink" "$size" "$atime" 0 "$mtime" 0 "$ctime" 0 "$blocks" "$blksize" >/dev/null 2>&1; then
+                log_info "Late kstat applied: $vpath (size=$size)"
+                ok=$((ok+1))
+            else
+                log_warn "Late kstat failed: $vpath"
+                fail=$((fail+1))
+            fi
+        else
+            if "$SUSFS_BIN" add_sus_kstat_statically "$vpath" \
+                "$ino" "$dev" "$nlink" "$size" "$atime" 0 "$mtime" 0 "$ctime" 0 "$blocks" "$blksize" >/dev/null 2>&1; then
+                ok=$((ok+1))
+            else
+                fail=$((fail+1))
+            fi
+        fi
+    done < "$deferred"
+    rm -f "$deferred"
+    log_info "Late kstat pass complete: $ok succeeded, $fail failed"
+    log_func_exit "late_kstat_pass" "$ok"
 }
 
 # ============================================================
