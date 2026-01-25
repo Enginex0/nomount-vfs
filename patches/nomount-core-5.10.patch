@@ -72,7 +72,7 @@ new file mode 100644
 index 000000000..43ca3f0fa
 --- /dev/null
 +++ b/fs/vfs_dcache.c
-@@ -0,0 +1,2879 @@
+@@ -0,0 +1,2885 @@
 +#include <linux/module.h>
 +#include <linux/kernel.h>
 +#include <linux/init.h>
@@ -1723,6 +1723,7 @@ index 000000000..43ca3f0fa
 +{
 +	struct nomount_rule *rule;
 +	char *target = NULL;
++	const char *norm_path;
 +	u32 hash;
 +
 +	if (nomount_is_critical_process())
@@ -1743,7 +1744,7 @@ index 000000000..43ca3f0fa
 +	}
 +
 +	/* Normalize path before hash lookup to match how rules are stored */
-+	const char *norm_path = nomount_normalize_path(pathname);
++	norm_path = nomount_normalize_path(pathname);
 +	NM_DBG("resolve_path: looking up %s (normalized: %s)\n", pathname, norm_path);
 +	hash = full_name_hash(NULL, norm_path, strlen(norm_path));
 +
@@ -2385,6 +2386,7 @@ index 000000000..43ca3f0fa
 +	struct nomount_ioctl_data data;
 +	struct nomount_rule *rule = NULL;
 +	struct hlist_node *tmp;
++	const char *norm_vpath;
 +	char *v_path;
 +	int bkt;
 +	bool found = false;
@@ -2401,7 +2403,7 @@ index 000000000..43ca3f0fa
 +	}
 +
 +	/* Normalize path for consistent comparison with stored rules */
-+	const char *norm_vpath = nomount_normalize_path(v_path);
++	norm_vpath = nomount_normalize_path(v_path);
 +	NM_INFO("del_rule: vpath=%s (normalized: %s)\n", v_path, norm_vpath);
 +
 +	spin_lock(&nomount_lock);
