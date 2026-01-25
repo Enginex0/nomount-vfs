@@ -31,6 +31,12 @@ else
     log_section() { log_info "========== $1 =========="; }
 fi
 
+# Ensure data directory exists and copy config if not present
+mkdir -p "$NOMOUNT_DATA" 2>/dev/null
+if [ -f "$MODDIR/config.sh" ] && [ ! -f "$NOMOUNT_DATA/config.sh" ]; then
+    cp "$MODDIR/config.sh" "$NOMOUNT_DATA/config.sh"
+fi
+
 # ============================================================
 # FUNCTION: Detect device architecture
 # Returns: arm64, arm, x86_64, or x86
