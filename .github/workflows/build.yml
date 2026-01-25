@@ -65,25 +65,27 @@ jobs:
         run: |
           mkdir -p module/zygisk
 
-          # Build arm64-v8a
+          # Build arm64-v8a (RELEASE_BUILD strips logging)
           mkdir -p build-arm64
           cmake -B build-arm64 -S zygisk-src \
             -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
             -DANDROID_ABI=arm64-v8a \
             -DANDROID_PLATFORM=android-26 \
             -DANDROID_STL=c++_static \
-            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_BUILD_TYPE=Release \
+            -DRELEASE_BUILD=ON
           cmake --build build-arm64 -j$(nproc)
           cp build-arm64/libhidemount.so module/zygisk/arm64-v8a.so
 
-          # Build armeabi-v7a
+          # Build armeabi-v7a (RELEASE_BUILD strips logging)
           mkdir -p build-arm
           cmake -B build-arm -S zygisk-src \
             -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
             -DANDROID_ABI=armeabi-v7a \
             -DANDROID_PLATFORM=android-26 \
             -DANDROID_STL=c++_static \
-            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_BUILD_TYPE=Release \
+            -DRELEASE_BUILD=ON
           cmake --build build-arm -j$(nproc)
           cp build-arm/libhidemount.so module/zygisk/armeabi-v7a.so
 
