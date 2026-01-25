@@ -4,6 +4,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <memory>
+#include <mutex>
 #include <vector>
 #include <string>
 #include <string_view>
@@ -97,17 +98,26 @@ static void HideFromMaps(const std::vector<std::string> &paths) {
         if (backup == MAP_FAILED) continue;
 
         int old_prot = GetProt(addr, len);
+        bool prot_changed = false;
+
         if (!(old_prot & PROT_READ)) {
             if (mprotect(addr, len, old_prot | PROT_READ) != 0) {
                 munmap(backup, len);
                 continue;
             }
+            prot_changed = true;
         }
 
         memcpy(backup, addr, len);
         void *result = mremap(backup, len, len, MREMAP_FIXED | MREMAP_MAYMOVE, addr);
+
         if (result != MAP_FAILED) {
             mprotect(addr, len, old_prot);
+        } else {
+            munmap(backup, len);
+            if (prot_changed) {
+                mprotect(addr, len, old_prot);
+            }
         }
     }
 }
@@ -117,11 +127,14 @@ static void PreloadFont(JNIEnv *env, const std::string &path) {
     static jmethodID methodId = nullptr;
 
     if (!typefaceClass) {
-        typefaceClass = env->FindClass("android/graphics/Typeface");
-        if (!typefaceClass) {
+        jclass localClass = env->FindClass("android/graphics/Typeface");
+        if (!localClass) {
             env->ExceptionClear();
             return;
         }
+        typefaceClass = (jclass)env->NewGlobalRef(localClass);
+        env->DeleteLocalRef(localClass);
+
         methodId = env->GetStaticMethodID(typefaceClass, "nativeWarmUpCache",
                                          "(Ljava/lang/String;)V");
         if (!methodId) {
@@ -131,6 +144,10 @@ static void PreloadFont(JNIEnv *env, const std::string &path) {
     }
 
     jstring jpath = env->NewStringUTF(path.c_str());
+    if (!jpath) {
+        env->ExceptionClear();
+        return;
+    }
     env->CallStaticVoidMethod(typefaceClass, methodId, jpath);
     if (env->ExceptionCheck()) {
         env->ExceptionClear();
@@ -217,22 +234,43 @@ private:
         if (companion == -1) return;
 
         int count = read_int(companion);
+        if (count < 0 || count > 10000) {
+            close(companion);
+            return;
+        }
+
         for (int i = 0; i < count; i++) {
             Rule rule;
 
             int vpath_len = read_int(companion);
-            if (vpath_len > 0 && vpath_len < 4096) {
-                rule.virtual_path.resize(vpath_len);
-                read_full(companion, rule.virtual_path.data(), vpath_len);
+            if (vpath_len <= 0 || vpath_len >= 4096) {
+                close(companion);
+                return;
+            }
+            rule.virtual_path.resize(vpath_len);
+            if (read_full(companion, rule.virtual_path.data(), vpath_len) != 0) {
+                close(companion);
+                return;
             }
 
             int rpath_len = read_int(companion);
-            if (rpath_len > 0 && rpath_len < 4096) {
-                rule.real_path.resize(rpath_len);
-                read_full(companion, rule.real_path.data(), rpath_len);
+            if (rpath_len <= 0 || rpath_len >= 4096) {
+                close(companion);
+                return;
+            }
+            rule.real_path.resize(rpath_len);
+            if (read_full(companion, rule.real_path.data(), rpath_len) != 0) {
+                close(companion);
+                return;
             }
 
-            rule.classification = static_cast<Classification>(read_int(companion));
+            int class_val = read_int(companion);
+            if (class_val < 0 || class_val > CLASS_CONFIG) {
+                rule.classification = CLASS_UNKNOWN;
+            } else {
+                rule.classification = static_cast<Classification>(class_val);
+            }
+
             rule.hide_from_maps = (read_int(companion) != 0);
 
             rules.push_back(std::move(rule));
@@ -243,7 +281,7 @@ private:
 };
 
 static std::vector<Rule> g_rules;
-static bool g_rules_loaded = false;
+static std::once_flag g_rules_init_flag;
 
 static bool LoadRulesFromConfig() {
     const char *config_path = "/data/adb/nomount/rules.conf";
@@ -326,12 +364,11 @@ static bool ScanModulesForFonts() {
 }
 
 static void CompanionEntry(int socket) {
-    if (!g_rules_loaded) {
-        g_rules_loaded = LoadRulesFromConfig();
-        if (!g_rules_loaded) {
-            g_rules_loaded = ScanModulesForFonts();
+    std::call_once(g_rules_init_flag, []() {
+        if (!LoadRulesFromConfig()) {
+            ScanModulesForFonts();
         }
-    }
+    });
 
     write_int(socket, g_rules.size());
 
