@@ -510,10 +510,24 @@ EOF
             # Generate pseudo-random inode
             ino=$(($(date +%s) + RANDOM))
             nlink=1
-            size=0
-            blocks=0
-            blksize=4096
-            log_debug "Synthesized: ino=$ino dev=$dev times from parent"
+            # Get actual size from real file - never use size=0 (detection vector)
+            if [ -n "$rpath" ] && [ -f "$rpath" ]; then
+                local rpath_stat=$(stat -c '%s|%b|%B' "$rpath" 2>/dev/null)
+                if [ -n "$rpath_stat" ]; then
+                    size=$(echo "$rpath_stat" | cut -d'|' -f1)
+                    blocks=$(echo "$rpath_stat" | cut -d'|' -f2)
+                    blksize=$(echo "$rpath_stat" | cut -d'|' -f3)
+                else
+                    size=0
+                    blocks=0
+                    blksize=4096
+                fi
+            else
+                size=0
+                blocks=0
+                blksize=4096
+            fi
+            log_debug "Synthesized: ino=$ino dev=$dev size=$size times from parent"
         else
             log_warn "Cannot get parent stats for $parent"
             log_func_exit "susfs_apply_kstat" "1" "no parent stats"
@@ -549,25 +563,11 @@ EOF
             blksize=$(echo "$real_stat" | cut -d'|' -f3)
             log_info "Kstat size override: $size (from $rpath)"
         else
-            log_warn "Stat failed for $rpath - using cached metadata, deferring for retry"
+            # Don't use statically - it would register with wrong inode (detection vector)
+            log_warn "Stat failed for $rpath - deferring for late_kstat_pass (redirect only)"
             echo "$vpath|$metadata|$rpath" >> "$NOMOUNT_DATA/.deferred_kstat" 2>/dev/null
-            cmd="add_sus_kstat_statically"
-            log_susfs_cmd "$cmd" "$vpath ino=$ino dev=$dev (cached)"
-            result=$("$SUSFS_BIN" "$cmd" "$vpath" \
-                "$ino" "$dev" "$nlink" "$size" \
-                "$atime" 0 "$mtime" 0 "$ctime" 0 \
-                "$blocks" "$blksize" 2>&1)
-            rc=$?
-            log_susfs_result "$rc" "$cmd" "$vpath"
-            if [ $rc -eq 0 ]; then
-                SUSFS_STATS_KSTAT=$((SUSFS_STATS_KSTAT + 1))
-                log_func_exit "susfs_apply_kstat" "0" "cached fallback"
-                return 0
-            fi
-            log_err "$cmd fallback failed: $result"
-            SUSFS_STATS_ERRORS=$((SUSFS_STATS_ERRORS + 1))
-            log_func_exit "susfs_apply_kstat" "1"
-            return 1
+            log_func_exit "susfs_apply_kstat" "0" "deferred"
+            return 0
         fi
         cmd="add_sus_kstat_redirect"
         log_susfs_cmd "$cmd" "$vpath $rpath ino=$ino dev=$dev"
@@ -577,13 +577,14 @@ EOF
             "$blocks" "$blksize" 2>&1)
         rc=$?
     else
-        cmd="add_sus_kstat_statically"
-        log_susfs_cmd "$cmd" "$vpath ino=$ino dev=$dev"
-        result=$("$SUSFS_BIN" "$cmd" "$vpath" \
-            "$ino" "$dev" "$nlink" "$size" \
-            "$atime" 0 "$mtime" 0 "$ctime" 0 \
-            "$blocks" "$blksize" 2>&1)
-        rc=$?
+        # No rpath or redirect unavailable - statically uses wrong inode (detection vector)
+        if [ -z "$rpath" ]; then
+            log_warn "No rpath provided for $vpath - skipping kstat (statically is unsafe)"
+        else
+            log_warn "Redirect unavailable for $vpath - skipping kstat (statically is unsafe)"
+        fi
+        log_func_exit "susfs_apply_kstat" "1" "no redirect"
+        return 1
     fi
     log_susfs_result "$rc" "$cmd" "$vpath"
 
@@ -624,22 +625,20 @@ late_kstat_pass() {
 $metadata
 EOF
 
-        if [ "$HAS_SUS_KSTAT_REDIRECT" = "1" ]; then
-            if "$SUSFS_BIN" add_sus_kstat_redirect "$vpath" "$rpath" \
-                "$ino" "$dev" "$nlink" "$size" "$atime" 0 "$mtime" 0 "$ctime" 0 "$blocks" "$blksize" >/dev/null 2>&1; then
-                log_info "Late kstat applied: $vpath (size=$size)"
-                ok=$((ok+1))
-            else
-                log_warn "Late kstat failed: $vpath"
-                fail=$((fail+1))
-            fi
+        # Only use redirect API - statically uses wrong inode (detection vector)
+        if [ "$HAS_SUS_KSTAT_REDIRECT" != "1" ]; then
+            log_warn "Late kstat: redirect unavailable, skipping $vpath (statically is unsafe)"
+            fail=$((fail+1))
+            continue
+        fi
+
+        if "$SUSFS_BIN" add_sus_kstat_redirect "$vpath" "$rpath" \
+            "$ino" "$dev" "$nlink" "$size" "$atime" 0 "$mtime" 0 "$ctime" 0 "$blocks" "$blksize" >/dev/null 2>&1; then
+            log_info "Late kstat applied: $vpath (size=$size)"
+            ok=$((ok+1))
         else
-            if "$SUSFS_BIN" add_sus_kstat_statically "$vpath" \
-                "$ino" "$dev" "$nlink" "$size" "$atime" 0 "$mtime" 0 "$ctime" 0 "$blocks" "$blksize" >/dev/null 2>&1; then
-                ok=$((ok+1))
-            else
-                fail=$((fail+1))
-            fi
+            log_warn "Late kstat failed: $vpath"
+            fail=$((fail+1))
         fi
     done < "$deferred"
     rm -f "$deferred"
