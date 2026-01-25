@@ -61,13 +61,20 @@ static int GetProt(void *addr, size_t len) {
 }
 
 static void HideFromMaps(const std::vector<std::string> &paths) {
+    LOGI("HideFromMaps: starting with %zu patterns", paths.size());
+
     FILE *maps = fopen("/proc/self/maps", "r");
-    if (!maps) return;
+    if (!maps) {
+        PLOGE("HideFromMaps: fopen /proc/self/maps");
+        return;
+    }
 
     char line[512];
     std::vector<std::tuple<void*, size_t, std::string>> to_hide;
+    int lines_scanned = 0;
 
     while (fgets(line, sizeof(line), maps)) {
+        lines_scanned++;
         uintptr_t start, end;
         char perms[5], pathname[256] = {0};
 
@@ -83,6 +90,7 @@ static void HideFromMaps(const std::vector<std::string> &paths) {
         for (const auto &hide_path : paths) {
             if (path_view.find(hide_path) != std::string_view::npos ||
                 path_view.find("/data/adb/modules") != std::string_view::npos) {
+                LOGD("HideFromMaps: match [%lx-%lx] %s", start, end, pathname);
                 to_hide.emplace_back(reinterpret_cast<void*>(start),
                                     end - start,
                                     std::string(path_view));
@@ -92,17 +100,26 @@ static void HideFromMaps(const std::vector<std::string> &paths) {
     }
     fclose(maps);
 
+    LOGI("HideFromMaps: scanned %d lines, found %zu to hide", lines_scanned, to_hide.size());
+
+    int hidden_ok = 0, hidden_fail = 0;
     for (const auto &[addr, len, path] : to_hide) {
         void *backup = mmap(nullptr, len, PROT_READ | PROT_WRITE,
                            MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-        if (backup == MAP_FAILED) continue;
+        if (backup == MAP_FAILED) {
+            PLOGE("HideFromMaps: mmap backup for %s", path.c_str());
+            hidden_fail++;
+            continue;
+        }
 
         int old_prot = GetProt(addr, len);
         bool prot_changed = false;
 
         if (!(old_prot & PROT_READ)) {
             if (mprotect(addr, len, old_prot | PROT_READ) != 0) {
+                PLOGE("HideFromMaps: mprotect for %s", path.c_str());
                 munmap(backup, len);
+                hidden_fail++;
                 continue;
             }
             prot_changed = true;
@@ -113,22 +130,31 @@ static void HideFromMaps(const std::vector<std::string> &paths) {
 
         if (result != MAP_FAILED) {
             mprotect(addr, len, old_prot);
+            LOGD("HideFromMaps: OK %s", path.c_str());
+            hidden_ok++;
         } else {
+            PLOGE("HideFromMaps: mremap for %s", path.c_str());
             munmap(backup, len);
             if (prot_changed) {
                 mprotect(addr, len, old_prot);
             }
+            hidden_fail++;
         }
     }
+
+    LOGI("HideFromMaps: done, hidden=%d failed=%d", hidden_ok, hidden_fail);
 }
 
 static void PreloadFont(JNIEnv *env, const std::string &path) {
     static jclass typefaceClass = nullptr;
     static jmethodID methodId = nullptr;
 
+    LOGD("PreloadFont: %s", path.c_str());
+
     if (!typefaceClass) {
         jclass localClass = env->FindClass("android/graphics/Typeface");
         if (!localClass) {
+            LOGE("PreloadFont: FindClass Typeface failed");
             env->ExceptionClear();
             return;
         }
@@ -138,19 +164,25 @@ static void PreloadFont(JNIEnv *env, const std::string &path) {
         methodId = env->GetStaticMethodID(typefaceClass, "nativeWarmUpCache",
                                          "(Ljava/lang/String;)V");
         if (!methodId) {
+            LOGE("PreloadFont: GetStaticMethodID nativeWarmUpCache failed");
             env->ExceptionClear();
             return;
         }
+        LOGI("PreloadFont: Typeface class initialized");
     }
 
     jstring jpath = env->NewStringUTF(path.c_str());
     if (!jpath) {
+        LOGE("PreloadFont: NewStringUTF failed for %s", path.c_str());
         env->ExceptionClear();
         return;
     }
     env->CallStaticVoidMethod(typefaceClass, methodId, jpath);
     if (env->ExceptionCheck()) {
+        LOGW("PreloadFont: exception for %s", path.c_str());
         env->ExceptionClear();
+    } else {
+        LOGD("PreloadFont: OK %s", path.c_str());
     }
     env->DeleteLocalRef(jpath);
 }
@@ -190,16 +222,24 @@ public:
     void onLoad(Api *_api, JNIEnv *_env) override {
         api = _api;
         env = _env;
+        LOGI("onLoad: HideMount module loaded");
     }
 
     void preAppSpecialize(AppSpecializeArgs *args) override {
+        const char *app_name = args->nice_name ? env->GetStringUTFChars(args->nice_name, nullptr) : "unknown";
+        LOGI("preAppSpecialize: %s (uid=%d)", app_name, args->uid);
+        if (args->nice_name) env->ReleaseStringUTFChars(args->nice_name, app_name);
+
         InitCompanion();
 
+        int fonts_preloaded = 0;
         for (const auto &rule : rules) {
             if (rule.classification == CLASS_FONT) {
                 PreloadFont(env, rule.virtual_path);
+                fonts_preloaded++;
             }
         }
+        LOGI("preAppSpecialize: preloaded %d fonts", fonts_preloaded);
 
         std::vector<std::string> paths_to_hide;
         for (const auto &rule : rules) {
@@ -209,7 +249,6 @@ public:
             }
         }
 
-        // Always hide common module paths
         paths_to_hide.push_back("/data/adb/modules");
         paths_to_hide.push_back("/data/adb/ksu");
         paths_to_hide.push_back("magisk");
@@ -218,9 +257,11 @@ public:
         HideFromMaps(paths_to_hide);
 
         api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+        LOGI("preAppSpecialize: done, requesting DLCLOSE");
     }
 
     void preServerSpecialize(ServerSpecializeArgs *args) override {
+        LOGI("preServerSpecialize: system_server, skipping");
         api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
     }
 
@@ -230,36 +271,46 @@ private:
     std::vector<Rule> rules;
 
     void InitCompanion() {
+        LOGD("InitCompanion: connecting...");
         int companion = api->connectCompanion();
-        if (companion == -1) return;
+        if (companion == -1) {
+            LOGE("InitCompanion: connectCompanion failed");
+            return;
+        }
 
         int count = read_int(companion);
         if (count < 0 || count > 10000) {
+            LOGE("InitCompanion: invalid count %d", count);
             close(companion);
             return;
         }
+        LOGI("InitCompanion: receiving %d rules", count);
 
         for (int i = 0; i < count; i++) {
             Rule rule;
 
             int vpath_len = read_int(companion);
             if (vpath_len <= 0 || vpath_len >= 4096) {
+                LOGE("InitCompanion: invalid vpath_len %d at rule %d", vpath_len, i);
                 close(companion);
                 return;
             }
             rule.virtual_path.resize(vpath_len);
             if (read_full(companion, rule.virtual_path.data(), vpath_len) != 0) {
+                LOGE("InitCompanion: read vpath failed at rule %d", i);
                 close(companion);
                 return;
             }
 
             int rpath_len = read_int(companion);
             if (rpath_len <= 0 || rpath_len >= 4096) {
+                LOGE("InitCompanion: invalid rpath_len %d at rule %d", rpath_len, i);
                 close(companion);
                 return;
             }
             rule.real_path.resize(rpath_len);
             if (read_full(companion, rule.real_path.data(), rpath_len) != 0) {
+                LOGE("InitCompanion: read rpath failed at rule %d", i);
                 close(companion);
                 return;
             }
@@ -273,10 +324,13 @@ private:
 
             rule.hide_from_maps = (read_int(companion) != 0);
 
+            LOGD("InitCompanion: rule[%d] vpath=%s class=%d hide=%d",
+                 i, rule.virtual_path.c_str(), rule.classification, rule.hide_from_maps);
             rules.push_back(std::move(rule));
         }
 
         close(companion);
+        LOGI("InitCompanion: loaded %zu rules", rules.size());
     }
 };
 
@@ -286,14 +340,17 @@ static std::once_flag g_rules_init_flag;
 static bool LoadRulesFromConfig() {
     const char *config_path = "/data/adb/nomount/rules.conf";
 
+    LOGI("LoadRulesFromConfig: opening %s", config_path);
     std::ifstream file(config_path);
     if (!file.is_open()) {
-        // Fallback: scan modules directly like FontLoader
+        LOGW("LoadRulesFromConfig: file not found, will scan modules");
         return false;
     }
 
     std::string line;
+    int line_num = 0;
     while (std::getline(file, line)) {
+        line_num++;
         if (line.empty() || line[0] == '#') continue;
 
         std::istringstream iss(line);
@@ -313,27 +370,41 @@ static bool LoadRulesFromConfig() {
         rule.classification = ClassifyPath(vpath);
         rule.hide_from_maps = (flags.find("MAPS") != std::string::npos);
 
+        LOGD("LoadRulesFromConfig: [%d] %s -> %s (class=%d, hide=%d)",
+             line_num, vpath.c_str(), rpath.c_str(), rule.classification, rule.hide_from_maps);
         g_rules.push_back(std::move(rule));
     }
 
+    LOGI("LoadRulesFromConfig: loaded %zu rules from config", g_rules.size());
     return !g_rules.empty();
 }
 
 static bool ScanModulesForFonts() {
+    LOGI("ScanModulesForFonts: scanning /data/adb/modules");
     DIR *modules_dir = opendir("/data/adb/modules");
-    if (!modules_dir) return false;
+    if (!modules_dir) {
+        PLOGE("ScanModulesForFonts: opendir /data/adb/modules");
+        return false;
+    }
 
     struct dirent *entry;
     char path[PATH_MAX];
+    int modules_checked = 0, fonts_found = 0;
 
     while ((entry = readdir(modules_dir))) {
         if (entry->d_type != DT_DIR || entry->d_name[0] == '.') continue;
 
         snprintf(path, PATH_MAX, "/data/adb/modules/%s/disable", entry->d_name);
-        if (access(path, F_OK) == 0) continue;
+        if (access(path, F_OK) == 0) {
+            LOGD("ScanModulesForFonts: %s disabled, skipping", entry->d_name);
+            continue;
+        }
 
         snprintf(path, PATH_MAX, "/data/adb/modules/%s/system/fonts", entry->d_name);
         if (access(path, F_OK) != 0) continue;
+
+        modules_checked++;
+        LOGD("ScanModulesForFonts: checking %s", entry->d_name);
 
         DIR *fonts_dir = opendir(path);
         if (!fonts_dir) continue;
@@ -353,23 +424,31 @@ static bool ScanModulesForFonts() {
                 rule.real_path += font_entry->d_name;
                 rule.classification = CLASS_FONT;
                 rule.hide_from_maps = true;
+                LOGD("ScanModulesForFonts: found %s", vpath);
                 g_rules.push_back(std::move(rule));
+                fonts_found++;
             }
         }
         closedir(fonts_dir);
     }
     closedir(modules_dir);
 
+    LOGI("ScanModulesForFonts: checked %d modules, found %d fonts", modules_checked, fonts_found);
     return !g_rules.empty();
 }
 
 static void CompanionEntry(int socket) {
+    LOGI("CompanionEntry: client connected (fd=%d)", socket);
+
     std::call_once(g_rules_init_flag, []() {
+        LOGI("CompanionEntry: initializing rules (first client)");
         if (!LoadRulesFromConfig()) {
             ScanModulesForFonts();
         }
+        LOGI("CompanionEntry: rules initialized, total=%zu", g_rules.size());
     });
 
+    LOGD("CompanionEntry: sending %zu rules", g_rules.size());
     write_int(socket, g_rules.size());
 
     for (const auto &rule : g_rules) {
@@ -384,6 +463,7 @@ static void CompanionEntry(int socket) {
     }
 
     close(socket);
+    LOGD("CompanionEntry: done, socket closed");
 }
 
 REGISTER_ZYGISK_MODULE(HideMountModule)
