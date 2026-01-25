@@ -804,6 +804,16 @@ if type late_kstat_pass >/dev/null 2>&1 && [ "$HAS_SUSFS" = "1" ]; then
     late_kstat_pass
 fi
 
+# Pre-warm kstat cache - force stat() on all files to trigger self-healing
+# This prevents race condition where detection apps see stale values
+log_info "Pre-warming kstat cache..."
+if [ -f "$NOMOUNT_DATA/.rule_cache" ]; then
+    grep "^add|" "$NOMOUNT_DATA/.rule_cache" 2>/dev/null | cut -d'|' -f2 | while read vpath; do
+        stat "$vpath" >/dev/null 2>&1
+    done
+    log_info "Kstat cache pre-warmed"
+fi
+
 # Calculate execution time
 END_TIME=$(date +%s)
 ELAPSED=$((END_TIME - START_TIME))
