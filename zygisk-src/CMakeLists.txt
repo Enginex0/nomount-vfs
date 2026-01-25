@@ -7,6 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_library(hidemount SHARED
     main.cpp
     misc.cpp
+    atexit.cpp
 )
 
 target_compile_options(hidemount PRIVATE
