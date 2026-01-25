@@ -240,7 +240,7 @@ if type susfs_init >/dev/null 2>&1; then
     log_info "Initializing SUSFS integration..."
     if susfs_init; then
         log_info "SUSFS integration initialized successfully"
-        susfs_status >> "$LOG_FILE"
+        log_info "Capabilities: path=$HAS_SUS_PATH loop=$HAS_SUS_PATH_LOOP mount=$HAS_SUS_MOUNT kstat=$HAS_SUS_KSTAT kstat_redirect=$HAS_SUS_KSTAT_REDIRECT maps=$HAS_SUS_MAPS"
     else
         log_info "SUSFS not available - continuing in NoMount-only mode"
     fi
@@ -766,6 +766,12 @@ else
     process_modules_direct
 fi
 
+# Late kstat pass - retry deferred entries now that boot has settled
+if type late_kstat_pass >/dev/null 2>&1 && [ "$HAS_SUSFS" = "1" ]; then
+    log_info "Running late kstat pass..."
+    late_kstat_pass
+fi
+
 # Calculate execution time
 END_TIME=$(date +%s)
 ELAPSED=$((END_TIME - START_TIME))
@@ -784,10 +790,11 @@ log_info "Execution time: ${ELAPSED}s"
 # SUSFS Integration Status
 if [ "$HAS_SUSFS" = "1" ]; then
     log_info "SUSFS Integration: ACTIVE"
-    log_info "  - sus_path: $HAS_SUS_PATH"
-    log_info "  - sus_kstat: $HAS_SUS_KSTAT"
-    log_info "  - sus_mount: $HAS_SUS_MOUNT"
-    log_info "  - sus_maps: $HAS_SUS_MAPS"
+    log_info "  - Paths hidden: $SUSFS_STATS_PATH"
+    log_info "  - Kstat applied: $SUSFS_STATS_KSTAT"
+    log_info "  - Mounts hidden: $SUSFS_STATS_MOUNT"
+    log_info "  - Maps hidden: $SUSFS_STATS_MAPS"
+    log_info "  - Errors: $SUSFS_STATS_ERRORS"
 else
     log_info "SUSFS Integration: DISABLED (NoMount-only mode)"
 fi
@@ -866,6 +873,62 @@ save_rule_cache() {
 
 # Call save_rule_cache at end of successful execution
 save_rule_cache
+
+# ============================================================
+# Generate rules.conf for Zygisk companion (HideMount)
+# ============================================================
+generate_rules_conf() {
+    local conf_file="$NOMOUNT_DATA/rules.conf"
+    local temp_file="$NOMOUNT_DATA/.rules_conf_tmp_$$"
+
+    : > "$temp_file"
+    echo "# NoMount Unified Rules - $(date)" >> "$temp_file"
+    echo "# Format: TYPE|VIRTUAL_PATH|REAL_PATH|FLAGS|APP_FILTER" >> "$temp_file"
+
+    local list_output
+    list_output=$("$LOADER" list 2>/dev/null)
+
+    if [ $? -eq 0 ] && [ -n "$list_output" ]; then
+        echo "$list_output" | while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            local rpath="${line%%->*}"
+            local vpath="${line##*->}"
+            [ -z "$vpath" ] || [ -z "$rpath" ] && continue
+
+            # Determine flags based on path type
+            local flags="KSTAT"
+            case "$vpath" in
+                *.so|*/lib/*|*/lib64/*) flags="KSTAT,MAPS" ;;
+                *.ttf|*.otf|*/fonts/*) flags="KSTAT,MAPS" ;;
+                *.jar|*.dex|*/framework/*) flags="KSTAT,MAPS" ;;
+            esac
+
+            echo "FILE|$vpath|$rpath|$flags|*" >> "$temp_file"
+        done
+    fi
+
+    # Add mount hiding rules
+    echo "MOUNT|/data/adb||HIDE|*" >> "$temp_file"
+    echo "MOUNT|/debug_ramdisk||HIDE|*" >> "$temp_file"
+
+    # Add maps pattern rules
+    echo "MAPS_PATTERN|/data/adb/modules|||*" >> "$temp_file"
+    echo "MAPS_PATTERN|magisk|||*" >> "$temp_file"
+    echo "MAPS_PATTERN|zygisk|||*" >> "$temp_file"
+    echo "MAPS_PATTERN|kernelsu|||*" >> "$temp_file"
+
+    if mv "$temp_file" "$conf_file" 2>/dev/null; then
+        local count=$(grep -c "^FILE|" "$conf_file" 2>/dev/null || echo 0)
+        log_info "Zygisk rules.conf generated: $count file rules"
+        chmod 644 "$conf_file" 2>/dev/null
+    else
+        log_err "Failed to generate rules.conf"
+        rm -f "$temp_file" 2>/dev/null
+    fi
+}
+
+# Generate rules.conf for Zygisk HideMount companion
+generate_rules_conf
 
 # Start monitor
 if [ "$monitor_new_modules" = "true" ]; then
