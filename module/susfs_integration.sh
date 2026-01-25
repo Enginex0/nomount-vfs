@@ -460,11 +460,8 @@ susfs_apply_kstat() {
     [ -z "$cache_key" ] && cache_key=$(echo "$vpath" | cksum | cut -d' ' -f1)
     cache_file="$METADATA_CACHE_DIR/$cache_key"
 
-    if [ -f "$cache_file" ] && grep -q "^NEW|" "$cache_file" 2>/dev/null; then
-        log_debug "Path is NEW file (not in stock), sus_kstat not needed: $vpath"
-        log_func_exit "susfs_apply_kstat" "skip" "new file"
-        return 0
-    fi
+    # NEW files still need kstat - they're injected via NoMount and stat() returns /data metadata
+    # The "NEW" case is handled below in the metadata parsing section
 
     local ino dev nlink size atime mtime ctime blocks blksize fstype
 
