@@ -3,6 +3,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -232,6 +233,13 @@ public:
 
         InitCompanion();
 
+        // Kernel-only mode: skip all Zygisk work
+        if (hiding_mode == 0) {
+            LOGI("preAppSpecialize: kernel-only mode, skipping");
+            api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+            return;
+        }
+
         int fonts_preloaded = 0;
         for (const auto &rule : rules) {
             if (rule.classification == CLASS_FONT) {
@@ -269,12 +277,25 @@ private:
     Api *api{};
     JNIEnv *env{};
     std::vector<Rule> rules;
+    int hiding_mode{1};
 
     void InitCompanion() {
         LOGD("InitCompanion: connecting...");
         int companion = api->connectCompanion();
         if (companion == -1) {
             LOGE("InitCompanion: connectCompanion failed");
+            return;
+        }
+
+        // Read mode first
+        hiding_mode = read_int(companion);
+        LOGI("InitCompanion: hiding_mode=%d", hiding_mode);
+
+        if (hiding_mode == 0) {
+            // Kernel-only mode: skip reading rules
+            read_int(companion);  // consume the 0 count
+            close(companion);
+            LOGI("InitCompanion: kernel-only mode, Zygisk work skipped");
             return;
         }
 
@@ -336,6 +357,28 @@ private:
 
 static std::vector<Rule> g_rules;
 static std::once_flag g_rules_init_flag;
+static int g_hiding_mode = 1;  // 0=kernel-only, 1=hybrid (default)
+
+static int LoadHidingMode() {
+    const char *config_path = "/data/adb/nomount/config.sh";
+    std::ifstream file(config_path);
+    if (!file.is_open()) {
+        LOGW("LoadHidingMode: config.sh not found, defaulting to hybrid mode");
+        return 1;
+    }
+
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.find("hiding_mode=") == 0) {
+            int mode = std::atoi(line.c_str() + 12);
+            LOGI("LoadHidingMode: mode=%d", mode);
+            return mode;
+        }
+    }
+
+    LOGW("LoadHidingMode: hiding_mode not found, defaulting to hybrid");
+    return 1;
+}
 
 static bool LoadRulesFromConfig() {
     const char *config_path = "/data/adb/nomount/rules.conf";
@@ -441,12 +484,28 @@ static void CompanionEntry(int socket) {
     LOGI("CompanionEntry: client connected (fd=%d)", socket);
 
     std::call_once(g_rules_init_flag, []() {
-        LOGI("CompanionEntry: initializing rules (first client)");
-        if (!LoadRulesFromConfig()) {
-            ScanModulesForFonts();
+        LOGI("CompanionEntry: initializing (first client)");
+        g_hiding_mode = LoadHidingMode();
+        if (g_hiding_mode == 1) {
+            if (!LoadRulesFromConfig()) {
+                ScanModulesForFonts();
+            }
+            LOGI("CompanionEntry: hybrid mode, %zu rules loaded", g_rules.size());
+        } else {
+            LOGI("CompanionEntry: kernel-only mode, Zygisk disabled");
         }
-        LOGI("CompanionEntry: rules initialized, total=%zu", g_rules.size());
     });
+
+    // Send mode first
+    write_int(socket, g_hiding_mode);
+
+    if (g_hiding_mode == 0) {
+        // Kernel-only mode: send 0 rules, client will skip all work
+        write_int(socket, 0);
+        close(socket);
+        LOGD("CompanionEntry: kernel-only mode, sent 0 rules");
+        return;
+    }
 
     LOGD("CompanionEntry: sending %zu rules", g_rules.size());
     write_int(socket, g_rules.size());

@@ -1,6 +1,11 @@
 # NoMount Universal Hijacker Configuration
 # Location: /data/adb/nomount/config.sh
 
+# --- Hiding Mode ---
+# 0 = Kernel-only (NoMount VFS + SUSFS, no Zygisk)
+# 1 = Hybrid (Kernel + Zygisk maps/font hiding) [default]
+hiding_mode=1
+
 # --- Universal Hijacker Mode ---
 # When enabled, NoMount will:
 # 1. Detect existing overlay mounts and hijack them to VFS
