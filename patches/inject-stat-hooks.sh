@@ -67,83 +67,7 @@ inject_include() {
 }
 
 # ============================================================================
-# INJECTION 2: Hook in generic_fillattr() after stat->ino = inode->i_ino;
-# ============================================================================
-inject_generic_fillattr_hook() {
-    local marker="nomount_is_injected_file"
-
-    if grep -q "$marker" "$TARGET"; then
-        info "generic_fillattr hook already injected, skipping."
-        return 0
-    fi
-
-    # Find anchor: stat->ino = inode->i_ino;
-    if ! grep -q 'stat->ino = inode->i_ino;' "$TARGET"; then
-        error "Anchor pattern 'stat->ino = inode->i_ino;' not found in $TARGET"
-    fi
-
-    info "Injecting generic_fillattr hook..."
-
-    # Inject after stat->ino = inode->i_ino;
-    sed -i '/stat->ino = inode->i_ino;/a\
-#ifdef CONFIG_FS_DCACHE_PREFETCH\
-	if (nomount_is_injected_file(inode)) {\
-		nomount_spoof_stat(inode, stat);\
-	}\
-#endif' "$TARGET"
-
-    # Verify
-    if ! grep -q "$marker" "$TARGET"; then
-        error "Failed to inject generic_fillattr hook"
-    fi
-
-    info "generic_fillattr hook injected successfully."
-}
-
-# ============================================================================
-# INJECTION 3: Hook in vfs_getattr_nosec() after generic_fillattr(inode, stat);
-# ============================================================================
-inject_vfs_getattr_nosec_hook() {
-    local marker="vfs_dcache_spoof_stat_dev"
-
-    if grep -q "$marker" "$TARGET"; then
-        info "vfs_getattr_nosec hook already injected, skipping."
-        return 0
-    fi
-
-    # Find anchor: generic_fillattr(inode, stat);
-    # This appears only once in vfs_getattr_nosec()
-    if ! grep -q 'generic_fillattr(inode, stat);' "$TARGET"; then
-        error "Anchor pattern 'generic_fillattr(inode, stat);' not found in $TARGET"
-    fi
-
-    info "Injecting vfs_getattr_nosec hook..."
-
-    # Inject after generic_fillattr(inode, stat);
-    sed -i '/generic_fillattr(inode, stat);/a\
-#ifdef CONFIG_FS_DCACHE_PREFETCH\
-	{\
-		char *__nm_buf = (char *)__get_free_page(GFP_KERNEL);\
-		if (__nm_buf) {\
-			char *__nm_path = d_path(path, __nm_buf, PAGE_SIZE);\
-			if (!IS_ERR(__nm_path)) {\
-				vfs_dcache_spoof_stat_dev(__nm_path, stat);\
-			}\
-			free_page((unsigned long)__nm_buf);\
-		}\
-	}\
-#endif' "$TARGET"
-
-    # Verify
-    if ! grep -q "$marker" "$TARGET"; then
-        error "Failed to inject vfs_getattr_nosec hook"
-    fi
-
-    info "vfs_getattr_nosec hook injected successfully."
-}
-
-# ============================================================================
-# INJECTION 4: Syscall-level hook in SYSCALL_DEFINE4(newfstatat)
+# INJECTION 2: Syscall hook in SYSCALL_DEFINE4(newfstatat)
 # This is the cleanest hook point - after VFS, before userspace copy
 # NOTE: cp_new_stat appears multiple times - in newstat, newlstat, AND newfstatat
 # We must only hook newfstatat which is SYSCALL_DEFINE4 (has dfd parameter)
@@ -190,7 +114,7 @@ inject_syscall_newfstatat_hook() {
 }
 
 # ============================================================================
-# INJECTION 5: Syscall-level hook in COMPAT_SYSCALL_DEFINE4(newfstatat)
+# INJECTION 3: Compat syscall hook in COMPAT_SYSCALL_DEFINE4(newfstatat)
 # 32-bit compatibility syscall
 # NOTE: cp_compat_stat appears multiple times - in newstat, newlstat, AND newfstatat
 # We must only hook newfstatat which uses vfs_fstatat (has dfd parameter)
@@ -240,7 +164,7 @@ inject_compat_syscall_newfstatat_hook() {
 }
 
 # ============================================================================
-# INJECTION 6: Syscall-level hook in SYSCALL_DEFINE4(fstatat64)
+# INJECTION 4: Syscall hook in SYSCALL_DEFINE4(fstatat64)
 # Some kernels use fstatat64 instead of newfstatat for 64-bit stat
 # ============================================================================
 inject_syscall_fstatat64_hook() {
@@ -277,8 +201,6 @@ inject_syscall_fstatat64_hook() {
 # Main execution
 # ============================================================================
 inject_include
-inject_generic_fillattr_hook
-inject_vfs_getattr_nosec_hook
 inject_syscall_newfstatat_hook
 inject_compat_syscall_newfstatat_hook
 inject_syscall_fstatat64_hook
